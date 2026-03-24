@@ -1,0 +1,9 @@
+---
+source: tests/e2e.rs
+expression: redact_hashes(&text)
+---
+Reset completed (mixed).
+- Previous HEAD: <HASH>
+- New HEAD: <HASH>
+- Target: HEAD~1
+To undo: git reset --soft <HASH>

@@ -1,0 +1,7 @@
+---
+source: tests/e2e.rs
+expression: "normalize_output(&redact_session_id(&text), repo.path_str())"
+---
+Session started.
+- Session ID: <SESSION_ID>
+- Repo root: <REPO>

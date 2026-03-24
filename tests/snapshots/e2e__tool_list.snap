@@ -1,0 +1,50 @@
+---
+source: tests/e2e.rs
+expression: tool_summary
+---
+[
+  {
+    "description": "Delete a merged branch. Only allowed if the branch's worktree was created by this session. Requires session_start.",
+    "name": "branch_delete"
+  },
+  {
+    "description": "Stage all changes and create a commit in the specified working directory. Does not require session_start.",
+    "name": "commit"
+  },
+  {
+    "description": "Show git diff (stat + patch) for a working directory. Does not require session_start.",
+    "name": "diff"
+  },
+  {
+    "description": "Show git log (commit history) for a working directory. Does not require session_start.",
+    "name": "log"
+  },
+  {
+    "description": "Merge a branch into the target branch (must be current branch). Session-guarded. Requires session_start.",
+    "name": "merge"
+  },
+  {
+    "description": "Safely reset HEAD to a target commit. Only supports 'soft' (move HEAD, keep staged and working tree) and 'mixed' (move HEAD, unstage changes, keep working tree) modes. Hard reset is intentionally not supported. Returns the previous HEAD hash for recovery. Does not require session_start.",
+    "name": "safe_reset"
+  },
+  {
+    "description": "Initialize the session with a git repository root. Must be called before using any repository-scoped tools (worktree_*, branch_delete, merge). Returns the session ID.",
+    "name": "session_start"
+  },
+  {
+    "description": "Show git status (branch, changed files) for a working directory. Does not require session_start.",
+    "name": "status"
+  },
+  {
+    "description": "Create a new git worktree under .worktrees/ with a new branch. Requires session_start. Registers the worktree to this session for ownership tracking.",
+    "name": "worktree_add"
+  },
+  {
+    "description": "List all git worktrees with their session ownership info. Requires session_start.",
+    "name": "worktree_list"
+  },
+  {
+    "description": "Remove a worktree. Only the session that created it can remove it. Requires session_start.",
+    "name": "worktree_remove"
+  }
+]

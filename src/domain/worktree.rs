@@ -43,3 +43,14 @@ pub struct MergeResult {
     pub into_branch: String,
     pub summary: String,
 }
+
+/// safe resetの結果。
+#[derive(Debug, Clone)]
+pub struct ResetResult {
+    /// reset前のHEADのshort hash
+    pub previous_head: String,
+    /// reset後のHEADのshort hash
+    pub new_head: String,
+    /// "soft" or "mixed"
+    pub mode: String,
+}

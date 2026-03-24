@@ -3,7 +3,7 @@ use std::process::Command;
 
 use crate::domain::error::DomainError;
 use crate::domain::worktree::{
-    CommitResult, DiffResult, LogEntry, MergeResult, RepoStatus, Worktree,
+    CommitResult, DiffResult, LogEntry, MergeResult, RepoStatus, ResetResult, Worktree,
 };
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String, DomainError> {
@@ -205,6 +205,29 @@ pub fn commit(working_dir: &Path, message: &str) -> Result<CommitResult, DomainE
         hash,
         message: message.to_string(),
         files_changed,
+    })
+}
+
+// ─── Reset ───────────────────────────────────────────────
+
+pub fn reset(working_dir: &Path, mode: &str, target: &str) -> Result<ResetResult, DomainError> {
+    if mode != "soft" && mode != "mixed" {
+        return Err(DomainError::Git(format!(
+            "unsupported reset mode: {mode}. Only 'soft' and 'mixed' are allowed"
+        )));
+    }
+
+    let previous_head = run_git(working_dir, &["rev-parse", "--short", "HEAD"])?;
+
+    let mode_flag = format!("--{mode}");
+    run_git(working_dir, &["reset", &mode_flag, target])?;
+
+    let new_head = run_git(working_dir, &["rev-parse", "--short", "HEAD"])?;
+
+    Ok(ResetResult {
+        previous_head,
+        new_head,
+        mode: mode.to_string(),
     })
 }
 

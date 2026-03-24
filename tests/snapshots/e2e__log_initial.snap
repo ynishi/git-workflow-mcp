@@ -1,0 +1,5 @@
+---
+source: tests/e2e.rs
+expression: redact_hashes(&text)
+---
+<HASH> initial

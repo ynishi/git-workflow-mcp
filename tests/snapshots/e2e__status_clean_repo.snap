@@ -1,0 +1,6 @@
+---
+source: tests/e2e.rs
+expression: "normalize_output(&text, repo.path_str())"
+---
+Branch: master
+Clean: true

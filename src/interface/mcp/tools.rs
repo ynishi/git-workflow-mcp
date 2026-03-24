@@ -73,6 +73,16 @@ struct LogRequest {
     max_count: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SafeResetRequest {
+    /// Working directory path (worktree or repo root)
+    working_dir: String,
+    /// Reset mode: "soft" (move HEAD only, keep staged and working tree) or "mixed" (move HEAD, unstage changes, keep working tree). Default: "mixed"
+    mode: Option<String>,
+    /// Target commit to reset to (e.g. "HEAD~1", "abc1234", "main"). Default: "HEAD~1"
+    target: Option<String>,
+}
+
 // ─── Tools ───────────────────────────────────────────────
 
 #[tool_router(vis = "pub(super)")]
@@ -405,6 +415,33 @@ impl GitWorkflowServer {
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             output,
+        )]))
+    }
+
+    #[tool(
+        name = "safe_reset",
+        description = "Safely reset HEAD to a target commit. Only supports 'soft' (move HEAD, keep staged and working tree) and 'mixed' (move HEAD, unstage changes, keep working tree) modes. Hard reset is intentionally not supported. Returns the previous HEAD hash for recovery. Does not require session_start.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false
+        )
+    )]
+    async fn safe_reset(
+        &self,
+        Parameters(req): Parameters<SafeResetRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let working_dir = std::path::Path::new(&req.working_dir);
+        let mode = req.mode.as_deref().unwrap_or("mixed");
+        let target = req.target.as_deref().unwrap_or("HEAD~1");
+
+        let result = git::reset(working_dir, mode, target).map_err(Self::to_mcp_error)?;
+
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            format!(
+                "Reset completed ({}).\n- Previous HEAD: {}\n- New HEAD: {}\n- Target: {}\nTo undo: git reset --soft {}",
+                result.mode, result.previous_head, result.new_head, target, result.previous_head
+            ),
         )]))
     }
 }
