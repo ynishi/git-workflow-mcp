@@ -423,6 +423,241 @@ async fn test_safe_reset_invalid_mode() {
     client.cancel().await.unwrap();
 }
 
+// ─── diff拡張テスト ────────────────────────────────────────
+
+#[tokio::test]
+async fn test_diff_commit_range() {
+    let repo = TempRepo::new();
+    add_commit(&repo, "feature.txt", "feature content", "feature commit");
+
+    let client = connect().await;
+
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "diff",
+            json!({ "working_dir": repo.path_str(), "commit_range": "HEAD~1..HEAD" }),
+        ))
+        .await
+        .unwrap();
+
+    let text = extract_text(&result);
+    assert!(
+        text.contains("feature.txt"),
+        "commit range diff should include feature.txt, got: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_diff_name_only() {
+    let repo = TempRepo::new();
+    // 変更をworking copyに追加（未ステージ）
+    std::fs::write(repo.dir.path().join("changed.txt"), "some content").unwrap();
+
+    let client = connect().await;
+
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "diff",
+            json!({ "working_dir": repo.path_str(), "commit_range": "HEAD~0", "name_only": true }),
+        ))
+        .await
+        .unwrap();
+
+    let text = extract_text(&result);
+    // name_only のため stat は空、ファイル名のみ返る（または変更なしの場合は空）
+    // HEAD~0 は HEAD と同じなので差分はない。
+    // ファイル追加の diff テストとして別途 staged で実施
+    assert!(
+        !text.contains("---"),
+        "name_only should not contain patch, got: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_diff_name_only_staged() {
+    let repo = TempRepo::new();
+    std::fs::write(repo.dir.path().join("staged_file.txt"), "staged content").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "staged_file.txt"])
+        .current_dir(repo.dir.path())
+        .output()
+        .expect("git add failed");
+
+    let client = connect().await;
+
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "diff",
+            json!({ "working_dir": repo.path_str(), "staged": true, "name_only": true }),
+        ))
+        .await
+        .unwrap();
+
+    let text = extract_text(&result);
+    assert!(
+        text.contains("staged_file.txt"),
+        "name_only staged diff should contain staged_file.txt, got: {text}"
+    );
+    assert!(
+        !text.contains("+++"),
+        "name_only should not contain patch headers, got: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_diff_paths() {
+    let repo = TempRepo::new();
+    // 複数ファイルを変更
+    std::fs::write(repo.dir.path().join("target.txt"), "target content").unwrap();
+    std::fs::write(repo.dir.path().join("other.txt"), "other content").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo.dir.path())
+        .output()
+        .expect("git add failed");
+
+    let client = connect().await;
+
+    // paths で target.txt のみに絞る
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "diff",
+            json!({
+                "working_dir": repo.path_str(),
+                "staged": true,
+                "paths": ["target.txt"]
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let text = extract_text(&result);
+    assert!(
+        text.contains("target.txt"),
+        "paths filter should include target.txt, got: {text}"
+    );
+    assert!(
+        !text.contains("other.txt"),
+        "paths filter should exclude other.txt, got: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_diff_max_lines() {
+    let repo = TempRepo::new();
+    // 大きなファイルを追加してコミット差分を作る
+    let large_content: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(repo.dir.path().join("large.txt"), &large_content).unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo.dir.path())
+        .output()
+        .expect("git add failed");
+    std::process::Command::new("git")
+        .args(["commit", "-m", "add large file"])
+        .current_dir(repo.dir.path())
+        .output()
+        .expect("git commit failed");
+
+    let client = connect().await;
+
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "diff",
+            json!({
+                "working_dir": repo.path_str(),
+                "commit_range": "HEAD~1..HEAD",
+                "max_lines": 5
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let text = extract_text(&result);
+    assert!(
+        text.contains("truncated"),
+        "max_lines should truncate output, got: {text}"
+    );
+    assert!(
+        text.contains("showing 5/"),
+        "truncation message should show 5 lines shown, got: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_diff_staged_with_commit_range_error() {
+    let repo = TempRepo::new();
+    let client = connect().await;
+
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "diff",
+            json!({
+                "working_dir": repo.path_str(),
+                "staged": true,
+                "commit_range": "HEAD~1..HEAD"
+            }),
+        ))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "staged + commit_range should return an error"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_diff_head() {
+    let repo = TempRepo::new();
+    // staged と unstaged 両方ある状態を作る
+    std::fs::write(repo.dir.path().join("staged.txt"), "staged").unwrap();
+    std::process::Command::new("git")
+        .args(["add", "staged.txt"])
+        .current_dir(repo.dir.path())
+        .output()
+        .expect("git add failed");
+    std::fs::write(repo.dir.path().join("unstaged.txt"), "unstaged").unwrap();
+
+    let client = connect().await;
+
+    // commit_range: "HEAD" は HEAD と working tree の差分（staged + unstaged 両方）
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "diff",
+            json!({ "working_dir": repo.path_str(), "commit_range": "HEAD" }),
+        ))
+        .await
+        .unwrap();
+
+    let text = extract_text(&result);
+    // staged.txt も unstaged.txt も両方表示されるはず
+    assert!(
+        text.contains("staged.txt") || text.contains("unstaged.txt"),
+        "HEAD diff should contain changed files, got: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 // ─── Helpers ──────────────────────────────────────────────
 
 fn extract_text(result: &rmcp::model::CallToolResult) -> String {

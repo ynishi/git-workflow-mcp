@@ -59,8 +59,16 @@ struct StatusRequest {
 struct DiffRequest {
     /// Working directory path (worktree or repo root)
     working_dir: String,
-    /// Show staged changes only (default: false)
+    /// Show staged changes only (default: false). Cannot be used with commit_range.
     staged: Option<bool>,
+    /// Commit range for comparison (e.g. "main..HEAD", "abc123..def456", "HEAD"). Cannot be used with staged.
+    commit_range: Option<String>,
+    /// Limit diff to specific file or directory paths
+    paths: Option<Vec<String>>,
+    /// Show only changed file names (no patch content)
+    name_only: Option<bool>,
+    /// Maximum number of diff output lines (truncates if exceeded)
+    max_lines: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -359,7 +367,7 @@ impl GitWorkflowServer {
 
     #[tool(
         name = "diff",
-        description = "Show git diff (stat + patch) for a working directory. Does not require session_start.",
+        description = "Show git diff for a working directory. Supports staged, commit range comparison, path filtering, name-only, and line limit. Does not require session_start.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -370,14 +378,44 @@ impl GitWorkflowServer {
         &self,
         Parameters(req): Parameters<DiffRequest>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
-        let working_dir = std::path::Path::new(&req.working_dir);
-        let result =
-            git::diff(working_dir, req.staged.unwrap_or(false)).map_err(Self::to_mcp_error)?;
+        // staged と commit_range の排他チェック
+        if req.staged.unwrap_or(false) && req.commit_range.is_some() {
+            return Err(rmcp::ErrorData::internal_error(
+                "staged and commit_range cannot be used together".to_string(),
+                None,
+            ));
+        }
 
-        let output = if result.stat.is_empty() && result.diff.is_empty() {
-            "No changes.".to_string()
+        let working_dir = std::path::Path::new(&req.working_dir);
+        let opts = git::DiffOptions {
+            staged: req.staged.unwrap_or(false),
+            commit_range: req.commit_range.clone(),
+            paths: req.paths.clone(),
+            name_only: req.name_only.unwrap_or(false),
+        };
+        let result = git::diff(working_dir, &opts).map_err(Self::to_mcp_error)?;
+
+        // max_lines truncation（diff フィールドのみに適用）
+        let diff_text = if let Some(max_lines) = req.max_lines {
+            let max_lines = max_lines as usize;
+            let lines: Vec<&str> = result.diff.lines().collect();
+            let total = lines.len();
+            if total > max_lines {
+                let shown = lines[..max_lines].join("\n");
+                format!("{shown}\n... (truncated, showing {max_lines}/{total} lines)")
+            } else {
+                result.diff.clone()
+            }
         } else {
-            format!("{}\n\n{}", result.stat, result.diff)
+            result.diff.clone()
+        };
+
+        let output = if result.stat.is_empty() && diff_text.is_empty() {
+            "No changes.".to_string()
+        } else if result.stat.is_empty() {
+            diff_text
+        } else {
+            format!("{}\n\n{}", result.stat, diff_text)
         };
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
