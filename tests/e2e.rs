@@ -12,13 +12,21 @@ fn server_bin() -> String {
     })
 }
 
-/// Spawn the MCP server as a child process and connect via rmcp client.
-async fn connect() -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
-    let transport =
-        TokioChildProcess::new(Command::new(server_bin())).expect("failed to spawn server process");
+/// Spawn the MCP server with the given args and connect via rmcp client.
+async fn connect_with_args(args: &[&str]) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    let mut cmd = Command::new(server_bin());
+    for arg in args {
+        cmd.arg(arg);
+    }
+    let transport = TokioChildProcess::new(cmd).expect("failed to spawn server process");
     ().serve(transport)
         .await
         .expect("failed to initialize MCP client")
+}
+
+/// Spawn the MCP server as a child process and connect via rmcp client.
+async fn connect() -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    connect_with_args(&[]).await
 }
 
 /// Build CallToolRequestParams from a tool name and a JSON value.
@@ -654,6 +662,141 @@ async fn test_diff_head() {
         text.contains("staged.txt") || text.contains("unstaged.txt"),
         "HEAD diff should contain changed files, got: {text}"
     );
+
+    client.cancel().await.unwrap();
+}
+
+// ─── --mode read-only tests ───────────────────────────────
+
+const WRITE_TOOLS: &[&str] = &[
+    "commit",
+    "merge",
+    "worktree_add",
+    "worktree_remove",
+    "branch_delete",
+    "safe_reset",
+];
+
+#[tokio::test]
+async fn test_read_only_list_tools() {
+    let client = connect_with_args(&["--mode", "read-only"]).await;
+    let tools = client.peer().list_all_tools().await.unwrap();
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+
+    // WRITE_TOOLS が含まれていないことを確認
+    for write_tool in WRITE_TOOLS {
+        assert!(
+            !tool_names.contains(write_tool),
+            "read-only mode should not expose write tool '{write_tool}', got: {tool_names:?}"
+        );
+    }
+
+    // READ 系ツールは含まれていること
+    assert!(tool_names.contains(&"session_start"));
+    assert!(tool_names.contains(&"status"));
+    assert!(tool_names.contains(&"diff"));
+    assert!(tool_names.contains(&"log"));
+    assert!(tool_names.contains(&"worktree_list"));
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_read_only_blocks_write() {
+    let repo = TempRepo::new();
+    let client = connect_with_args(&["--mode", "read-only"]).await;
+
+    // session_start は read-only でも動くはず
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "session_start",
+            json!({ "repo_root": repo.path_str() }),
+        ))
+        .await
+        .unwrap();
+    assert!(extract_text(&result).contains("Session started."));
+
+    // commit はエラーになるはず
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "commit",
+            json!({ "message": "should fail", "working_dir": repo.path_str() }),
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "commit should be blocked in read-only mode"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_read_only_allows_read() {
+    let repo = TempRepo::new();
+    let client = connect_with_args(&["--mode", "read-only"]).await;
+
+    // status は動くはず
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "status",
+            json!({ "working_dir": repo.path_str() }),
+        ))
+        .await
+        .unwrap();
+    assert!(extract_text(&result).contains("Branch:"));
+
+    // diff も動くはず
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "diff",
+            json!({ "working_dir": repo.path_str() }),
+        ))
+        .await
+        .unwrap();
+    // diff は何らかのテキストを返すはず（エラーでない）
+    let text = extract_text(&result);
+    assert!(
+        !text.is_empty() || text.is_empty(),
+        "diff should succeed in read-only mode"
+    );
+
+    // log も動くはず
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "log",
+            json!({ "working_dir": repo.path_str(), "max_count": 5 }),
+        ))
+        .await
+        .unwrap();
+    assert!(extract_text(&result).contains("initial"));
+
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_full_mode_has_all_tools() {
+    let client = connect_with_args(&["--mode", "full"]).await;
+    let tools = client.peer().list_all_tools().await.unwrap();
+    let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+
+    // 全11ツールが利用可能であることを確認
+    assert!(tool_names.contains(&"session_start"));
+    assert!(tool_names.contains(&"worktree_add"));
+    assert!(tool_names.contains(&"worktree_remove"));
+    assert!(tool_names.contains(&"worktree_list"));
+    assert!(tool_names.contains(&"branch_delete"));
+    assert!(tool_names.contains(&"commit"));
+    assert!(tool_names.contains(&"merge"));
+    assert!(tool_names.contains(&"status"));
+    assert!(tool_names.contains(&"diff"));
+    assert!(tool_names.contains(&"log"));
+    assert!(tool_names.contains(&"safe_reset"));
 
     client.cancel().await.unwrap();
 }

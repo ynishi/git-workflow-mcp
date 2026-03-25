@@ -18,8 +18,25 @@ use rmcp::{
 use crate::domain::session::SessionId;
 use crate::infra::session_store::SessionStore;
 
-pub async fn run() -> anyhow::Result<()> {
-    let server = GitWorkflowServer::new();
+/// read-only モードでブロックするツール名
+const WRITE_TOOLS: &[&str] = &[
+    "commit",
+    "merge",
+    "worktree_add",
+    "worktree_remove",
+    "branch_delete",
+    "safe_reset",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ServerMode {
+    #[default]
+    Full,
+    ReadOnly,
+}
+
+pub async fn run(mode: ServerMode) -> anyhow::Result<()> {
+    let server = GitWorkflowServer::new(mode);
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -30,14 +47,16 @@ pub(super) struct GitWorkflowServer {
     pub(super) repo_root: Arc<RwLock<Option<PathBuf>>>,
     pub(super) session_id: SessionId,
     tool_router: ToolRouter<Self>,
+    mode: ServerMode,
 }
 
 impl GitWorkflowServer {
-    fn new() -> Self {
+    fn new(mode: ServerMode) -> Self {
         Self {
             repo_root: Arc::new(RwLock::new(None)),
             session_id: SessionId::new(),
             tool_router: Self::tool_router(),
+            mode,
         }
     }
 
@@ -62,6 +81,26 @@ impl GitWorkflowServer {
 
 impl ServerHandler for GitWorkflowServer {
     fn get_info(&self) -> ServerInfo {
+        let base_instructions = "Git workflow operations for agent pipelines.\n\
+             \n\
+             IMPORTANT: Call session_start(repo_root) first before using any \
+             repository-scoped tools (worktree_*, branch_delete, merge).\n\
+             \n\
+             Session-based safety: each MCP session gets a unique ID. \
+             Destructive operations (worktree_remove, branch_delete, merge) \
+             only work on worktrees created by the same session.\n\
+             \n\
+             Workflow: session_start → worktree_add → (work) → commit → merge → worktree_remove → branch_delete";
+
+        let instructions = if self.mode == ServerMode::ReadOnly {
+            format!(
+                "{base_instructions}\n\n\
+                 NOTE: This server is running in read-only mode. Write operations are disabled."
+            )
+        } else {
+            base_instructions.to_string()
+        };
+
         ServerInfo {
             protocol_version: ProtocolVersion::V_2025_03_26,
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -77,19 +116,7 @@ impl ServerHandler for GitWorkflowServer {
                 icons: None,
                 website_url: None,
             },
-            instructions: Some(
-                "Git workflow operations for agent pipelines.\n\
-                 \n\
-                 IMPORTANT: Call session_start(repo_root) first before using any \
-                 repository-scoped tools (worktree_*, branch_delete, merge).\n\
-                 \n\
-                 Session-based safety: each MCP session gets a unique ID. \
-                 Destructive operations (worktree_remove, branch_delete, merge) \
-                 only work on worktrees created by the same session.\n\
-                 \n\
-                 Workflow: session_start → worktree_add → (work) → commit → merge → worktree_remove → branch_delete"
-                    .to_string(),
-            ),
+            instructions: Some(instructions),
         }
     }
 
@@ -98,8 +125,12 @@ impl ServerHandler for GitWorkflowServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
+        let mut tools = self.tool_router.list_all();
+        if self.mode == ServerMode::ReadOnly {
+            tools.retain(|t| !WRITE_TOOLS.contains(&t.name.as_ref()));
+        }
         Ok(ListToolsResult {
-            tools: self.tool_router.list_all(),
+            tools,
             next_cursor: None,
             meta: None,
         })
@@ -110,6 +141,12 @@ impl ServerHandler for GitWorkflowServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        if self.mode == ServerMode::ReadOnly && WRITE_TOOLS.contains(&request.name.as_ref()) {
+            return Err(McpError::invalid_params(
+                format!("tool '{}' is not available in read-only mode", request.name),
+                None,
+            ));
+        }
         let tool_ctx = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
         self.tool_router.call(tool_ctx).await
     }

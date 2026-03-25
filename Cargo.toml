@@ -9,6 +9,7 @@ repository = "https://github.com/ynishi/git-workflow-mcp"
 
 [dependencies]
 anyhow = "1.0.102"
+clap = { version = "4", features = ["derive"] }
 rmcp = { version = "0.15", features = ["server", "transport-io", "macros"] }
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
