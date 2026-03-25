@@ -12,7 +12,7 @@ expression: tool_summary
     "name": "commit"
   },
   {
-    "description": "Show git diff (stat + patch) for a working directory. Does not require session_start.",
+    "description": "Show git diff for a working directory. Supports staged, commit range comparison, path filtering, name-only, and line limit. Does not require session_start.",
     "name": "diff"
   },
   {

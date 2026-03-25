@@ -114,6 +114,14 @@ pub fn branch_delete(repo: &Path, branch: &str) -> Result<(), DomainError> {
 
 // ─── Status / Diff ───────────────────────────────────────
 
+#[derive(Default)]
+pub struct DiffOptions {
+    pub staged: bool,
+    pub commit_range: Option<String>,
+    pub paths: Option<Vec<String>>,
+    pub name_only: bool,
+}
+
 pub fn status(working_dir: &Path) -> Result<RepoStatus, DomainError> {
     let branch = run_git(working_dir, &["branch", "--show-current"])?;
     let status_output = run_git(working_dir, &["status", "--short"])?;
@@ -131,17 +139,57 @@ pub fn status(working_dir: &Path) -> Result<RepoStatus, DomainError> {
     })
 }
 
-pub fn diff(working_dir: &Path, staged: bool) -> Result<DiffResult, DomainError> {
-    let stat_args = if staged {
-        vec!["diff", "--cached", "--stat"]
-    } else {
-        vec!["diff", "--stat"]
-    };
-    let diff_args = if staged {
-        vec!["diff", "--cached"]
-    } else {
-        vec!["diff"]
-    };
+pub fn diff(working_dir: &Path, opts: &DiffOptions) -> Result<DiffResult, DomainError> {
+    // name_only モード: stat は不要、name-only diff のみ返す
+    if opts.name_only {
+        let mut args = vec!["diff", "--name-only"];
+        let range_owned;
+        if let Some(ref range) = opts.commit_range {
+            range_owned = range.clone();
+            args.push(&range_owned);
+        } else if opts.staged {
+            args.push("--cached");
+        }
+        let paths_owned: Vec<String>;
+        if let Some(ref paths) = opts.paths {
+            args.push("--");
+            paths_owned = paths.clone();
+            for p in &paths_owned {
+                args.push(p.as_str());
+            }
+        }
+        let output = run_git(working_dir, &args)?;
+        return Ok(DiffResult {
+            stat: String::new(),
+            diff: output,
+        });
+    }
+
+    // stat + patch モード
+    let range_owned;
+    let paths_owned: Vec<String>;
+
+    let mut stat_args = vec!["diff", "--stat"];
+    let mut diff_args = vec!["diff"];
+
+    if let Some(ref range) = opts.commit_range {
+        range_owned = range.clone();
+        stat_args.push(&range_owned);
+        diff_args.push(&range_owned);
+    } else if opts.staged {
+        stat_args.push("--cached");
+        diff_args.push("--cached");
+    }
+
+    if let Some(ref paths) = opts.paths {
+        stat_args.push("--");
+        diff_args.push("--");
+        paths_owned = paths.clone();
+        for p in &paths_owned {
+            stat_args.push(p.as_str());
+            diff_args.push(p.as_str());
+        }
+    }
 
     let stat = run_git(working_dir, &stat_args)?;
     let diff_output = run_git(working_dir, &diff_args)?;
