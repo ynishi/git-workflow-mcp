@@ -210,19 +210,52 @@ pub fn worktree_list(repo: &Path) -> Result<Vec<Worktree>, DomainError> {
 ///
 /// # Preconditions
 ///
-/// If `working_dir` is `Some`, the path must exist and be a directory.
+/// If `working_dir` is `Some`:
+/// 1. The path must exist and be a directory.
+/// 2. Its canonicalized path must match either `repo` itself or one of the
+///    worktrees registered in `repo` (via `git worktree list`). Arbitrary
+///    directories — including unrelated git repositories — are rejected to
+///    prevent accidentally deleting a same-named branch in a foreign repo.
 pub fn branch_delete(
     repo: &Path,
     branch: &str,
     working_dir: Option<&Path>,
 ) -> Result<(), DomainError> {
-    if let Some(wd) = working_dir
-        && !wd.is_dir()
-    {
-        return Err(DomainError::Git(format!(
-            "working_dir does not exist or is not a directory: {}",
-            wd.display()
-        )));
+    if let Some(wd) = working_dir {
+        if !wd.is_dir() {
+            return Err(DomainError::Git(format!(
+                "working_dir does not exist or is not a directory: {}",
+                wd.display()
+            )));
+        }
+        let wd_canon = wd.canonicalize().map_err(|e| {
+            DomainError::Git(format!(
+                "failed to canonicalize working_dir {}: {e}",
+                wd.display()
+            ))
+        })?;
+        let repo_canon = repo.canonicalize().map_err(|e| {
+            DomainError::Git(format!(
+                "failed to canonicalize repo {}: {e}",
+                repo.display()
+            ))
+        })?;
+        let is_known = wd_canon == repo_canon || {
+            let worktrees = worktree_list(repo)?;
+            worktrees.iter().any(|w| {
+                Path::new(&w.path)
+                    .canonicalize()
+                    .map(|p| p == wd_canon)
+                    .unwrap_or(false)
+            })
+        };
+        if !is_known {
+            return Err(DomainError::Git(format!(
+                "working_dir is neither repo root nor a known worktree of {}: {}",
+                repo.display(),
+                wd.display()
+            )));
+        }
     }
     let run_dir = working_dir.unwrap_or(repo);
 
@@ -847,6 +880,43 @@ mod tests {
             result.is_ok(),
             "branch_delete without working_dir should work on repo root: {:?}",
             result
+        );
+    }
+
+    // ── M-1: 未登録の working_dir は拒否される ──
+
+    #[test]
+    fn test_branch_delete_rejects_unknown_working_dir() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // 別の独立した repo を作成（repo の worktree ではない）
+        let foreign = init_repo();
+        let foreign_path = foreign.path();
+
+        // repo 側に削除対象の branch を用意（main HEAD から分岐）
+        StdCommand::new("git")
+            .args(["branch", "feat/reject-wd"])
+            .current_dir(repo_path)
+            .output()
+            .expect("git branch");
+
+        // foreign_path は repo の worktree ではないため拒否されるべき
+        let result = branch_delete(repo_path, "feat/reject-wd", Some(foreign_path));
+        assert!(
+            result.is_err(),
+            "branch_delete should reject working_dir that is not a known worktree"
+        );
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("neither repo root nor a known worktree"),
+            "error should indicate unknown worktree: {msg}"
+        );
+
+        // branch は残存しているはず
+        assert!(
+            branch_exists(repo_path, "feat/reject-wd").unwrap(),
+            "branch should not have been deleted"
         );
     }
 
