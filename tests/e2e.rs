@@ -801,7 +801,408 @@ async fn test_full_mode_has_all_tools() {
     client.cancel().await.unwrap();
 }
 
+// ─── E1: base_branch テスト ───────────────────────────────
+
+/// topic branch を作成してから subtask worktree を topic から分岐するテスト
+#[tokio::test]
+async fn test_worktree_add_with_base_branch() {
+    let repo = TempRepo::new();
+    let client = connect().await;
+
+    // session_start
+    client
+        .peer()
+        .call_tool(call_params(
+            "session_start",
+            json!({ "repo_root": repo.path_str() }),
+        ))
+        .await
+        .unwrap();
+
+    // topic branch を worktree として作成（base_branch なし）
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "worktree_add",
+            json!({ "name": "topic-foo", "branch": "topic/foo" }),
+        ))
+        .await
+        .unwrap();
+    assert!(extract_text(&result).contains("Worktree created."));
+
+    // topic/foo に commit を1本追加（topic worktree で直接 git commit）
+    add_commit_in_dir(
+        &repo.dir.path().join(".worktrees").join("topic-foo"),
+        "topic_file.txt",
+        "topic content",
+        "topic commit",
+    );
+
+    // subtask worktree を topic/foo から分岐
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "worktree_add",
+            json!({
+                "name": "subtask1",
+                "branch": "task/subtask1",
+                "base_branch": "topic/foo"
+            }),
+        ))
+        .await
+        .unwrap();
+    let text = extract_text(&result);
+    assert!(
+        text.contains("Worktree created."),
+        "expected worktree created, got: {text}"
+    );
+    assert!(text.contains("task/subtask1"));
+
+    // subtask worktree が topic/foo の commit を含むことを確認
+    let log_result = client
+        .peer()
+        .call_tool(call_params(
+            "log",
+            json!({
+                "working_dir": format!("{}/.worktrees/subtask1", repo.path_str()),
+                "max_count": 10
+            }),
+        ))
+        .await
+        .unwrap();
+    let log_text = extract_text(&log_result);
+    assert!(
+        log_text.contains("topic commit"),
+        "subtask worktree should contain topic commit, got: {log_text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// 存在しない base_branch を指定したときのエラーテスト
+#[tokio::test]
+async fn test_worktree_add_nonexistent_base_branch() {
+    let repo = TempRepo::new();
+    let client = connect().await;
+
+    client
+        .peer()
+        .call_tool(call_params(
+            "session_start",
+            json!({ "repo_root": repo.path_str() }),
+        ))
+        .await
+        .unwrap();
+
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "worktree_add",
+            json!({
+                "name": "bad-wt",
+                "branch": "task/bad",
+                "base_branch": "nonexistent/branch"
+            }),
+        ))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "nonexistent base_branch should return an error"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// 既存 branch 名との衝突テスト
+#[tokio::test]
+async fn test_worktree_add_branch_collision() {
+    let repo = TempRepo::new();
+    let client = connect().await;
+
+    client
+        .peer()
+        .call_tool(call_params(
+            "session_start",
+            json!({ "repo_root": repo.path_str() }),
+        ))
+        .await
+        .unwrap();
+
+    // topic/foo を作成
+    client
+        .peer()
+        .call_tool(call_params(
+            "worktree_add",
+            json!({ "name": "topic-foo2", "branch": "topic/foo2" }),
+        ))
+        .await
+        .unwrap();
+
+    // 同じ branch 名で再度 worktree_add（base_branch 付き）
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "worktree_add",
+            json!({
+                "name": "subtask-collision",
+                "branch": "topic/foo2",
+                "base_branch": "topic/foo2"
+            }),
+        ))
+        .await;
+
+    assert!(result.is_err(), "branch collision should return an error");
+
+    client.cancel().await.unwrap();
+}
+
+/// base_branch がどの worktree にも checkout されていない場合 (ref のみ) は dirty 判定なしで通過
+#[tokio::test]
+async fn test_worktree_add_base_branch_not_checked_out() {
+    let repo = TempRepo::new();
+
+    // base_branch を worktree を使わずに直接 git branch で作成（ref のみ）
+    std::process::Command::new("git")
+        .args(["branch", "base-ref-only"])
+        .current_dir(repo.dir.path())
+        .output()
+        .expect("git branch failed");
+
+    let client = connect().await;
+
+    client
+        .peer()
+        .call_tool(call_params(
+            "session_start",
+            json!({ "repo_root": repo.path_str() }),
+        ))
+        .await
+        .unwrap();
+
+    // base-ref-only はどの worktree にも checkout されていないため dirty チェックなしで成功
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "worktree_add",
+            json!({
+                "name": "from-ref",
+                "branch": "task/from-ref",
+                "base_branch": "base-ref-only"
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let text = extract_text(&result);
+    assert!(
+        text.contains("Worktree created."),
+        "should succeed when base_branch is not checked out, got: {text}"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+// ─── E2: merge working_dir テスト ────────────────────────
+
+/// topic worktree の HEAD が topic/xxx のとき working_dir 指定で merge が成功するテスト
+#[tokio::test]
+async fn test_merge_with_working_dir() {
+    let repo = TempRepo::new();
+    let client = connect().await;
+
+    client
+        .peer()
+        .call_tool(call_params(
+            "session_start",
+            json!({ "repo_root": repo.path_str() }),
+        ))
+        .await
+        .unwrap();
+
+    // topic worktree を作成
+    client
+        .peer()
+        .call_tool(call_params(
+            "worktree_add",
+            json!({ "name": "topic-merge", "branch": "topic/merge-test" }),
+        ))
+        .await
+        .unwrap();
+
+    // subtask worktree を topic/merge-test から分岐
+    client
+        .peer()
+        .call_tool(call_params(
+            "worktree_add",
+            json!({
+                "name": "subtask-merge",
+                "branch": "task/subtask-merge",
+                "base_branch": "topic/merge-test"
+            }),
+        ))
+        .await
+        .unwrap();
+
+    // subtask worktree に commit を追加
+    add_commit_in_dir(
+        &repo.dir.path().join(".worktrees").join("subtask-merge"),
+        "subtask_file.txt",
+        "subtask content",
+        "subtask commit",
+    );
+
+    // topic worktree を working_dir として merge
+    let topic_wt_path = format!("{}/.worktrees/topic-merge", repo.path_str());
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "merge",
+            json!({
+                "branch": "task/subtask-merge",
+                "into_branch": "topic/merge-test",
+                "working_dir": topic_wt_path
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let text = extract_text(&result);
+    assert!(
+        text.contains("Merged"),
+        "merge with working_dir should succeed, got: {text}"
+    );
+    assert!(text.contains("task/subtask-merge"));
+
+    client.cancel().await.unwrap();
+}
+
+/// working_dir 指定で HEAD 不一致の場合はエラーになること
+#[tokio::test]
+async fn test_merge_with_wrong_working_dir() {
+    let repo = TempRepo::new();
+    let client = connect().await;
+
+    client
+        .peer()
+        .call_tool(call_params(
+            "session_start",
+            json!({ "repo_root": repo.path_str() }),
+        ))
+        .await
+        .unwrap();
+
+    // topic-a worktree
+    client
+        .peer()
+        .call_tool(call_params(
+            "worktree_add",
+            json!({ "name": "topic-a", "branch": "topic/a" }),
+        ))
+        .await
+        .unwrap();
+
+    // topic-b worktree
+    client
+        .peer()
+        .call_tool(call_params(
+            "worktree_add",
+            json!({ "name": "topic-b", "branch": "topic/b" }),
+        ))
+        .await
+        .unwrap();
+
+    // topic-a の worktree を指定しているが into_branch は topic/b（HEAD 不一致）
+    let topic_a_path = format!("{}/.worktrees/topic-a", repo.path_str());
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "merge",
+            json!({
+                "branch": "topic/b",
+                "into_branch": "topic/b",
+                "working_dir": topic_a_path
+            }),
+        ))
+        .await;
+
+    assert!(
+        result.is_err(),
+        "merge with HEAD mismatch should return an error"
+    );
+
+    client.cancel().await.unwrap();
+}
+
+/// working_dir 省略時の挙動が現行と同一であること
+#[tokio::test]
+async fn test_merge_without_working_dir() {
+    let repo = TempRepo::new();
+    let client = connect().await;
+
+    client
+        .peer()
+        .call_tool(call_params(
+            "session_start",
+            json!({ "repo_root": repo.path_str() }),
+        ))
+        .await
+        .unwrap();
+
+    // feature worktree を作成して commit を追加
+    client
+        .peer()
+        .call_tool(call_params(
+            "worktree_add",
+            json!({ "name": "feature-compat", "branch": "task/compat" }),
+        ))
+        .await
+        .unwrap();
+
+    add_commit_in_dir(
+        &repo.dir.path().join(".worktrees").join("feature-compat"),
+        "compat_file.txt",
+        "compat content",
+        "compat commit",
+    );
+
+    // working_dir を省略 → repo root (main branch) に merge しようとするとエラーになるはず
+    // （repo root の HEAD が main/master であり task/compat ではないため）
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "merge",
+            json!({
+                "branch": "task/compat",
+                "into_branch": "task/compat"
+            }),
+        ))
+        .await;
+
+    // repo root の HEAD は main/master なので into_branch=task/compat は不一致 → エラー
+    assert!(
+        result.is_err(),
+        "merge into branch that is not current HEAD at repo root should error"
+    );
+
+    client.cancel().await.unwrap();
+}
+
 // ─── Helpers ──────────────────────────────────────────────
+
+fn add_commit_in_dir(dir: &std::path::Path, filename: &str, content: &str, message: &str) {
+    std::fs::write(dir.join(filename), content).unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir)
+        .output()
+        .expect("git add failed");
+    std::process::Command::new("git")
+        .args(["commit", "-m", message])
+        .current_dir(dir)
+        .output()
+        .expect("git commit failed");
+}
 
 fn extract_text(result: &rmcp::model::CallToolResult) -> String {
     result

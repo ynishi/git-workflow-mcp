@@ -22,7 +22,27 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String, DomainError> {
 
 // ─── Worktree ────────────────────────────────────────────
 
-pub fn worktree_add(repo: &Path, worktree_name: &str, branch: &str) -> Result<String, DomainError> {
+pub fn worktree_add(
+    repo: &Path,
+    worktree_name: &str,
+    branch: &str,
+    base_branch: Option<&str>,
+) -> Result<String, DomainError> {
+    // Read ENV on every call (not cached). Values "1"/"true"/"yes" enable skip.
+    let allow_dirty = {
+        let val = std::env::var("GIT_WORKFLOW_ALLOW_DIRTY_BASE").unwrap_or_default();
+        matches!(val.as_str(), "1" | "true" | "yes")
+    };
+    worktree_add_impl(repo, worktree_name, branch, base_branch, allow_dirty)
+}
+
+fn worktree_add_impl(
+    repo: &Path,
+    worktree_name: &str,
+    branch: &str,
+    base_branch: Option<&str>,
+    allow_dirty: bool,
+) -> Result<String, DomainError> {
     let worktree_path = repo.join(".worktrees").join(worktree_name);
     if worktree_path.exists() {
         return Err(DomainError::WorktreeAlreadyExists(
@@ -30,15 +50,49 @@ pub fn worktree_add(repo: &Path, worktree_name: &str, branch: &str) -> Result<St
         ));
     }
 
-    // ブランチ作成
-    let branch_result = run_git(repo, &["branch", branch]);
-    if let Err(DomainError::Git(ref msg)) = branch_result
-        && !msg.contains("already exists")
-    {
-        return Err(branch_result.unwrap_err());
+    if let Some(base) = base_branch {
+        // E1 precondition #1: branch collision check
+        let existing = run_git(repo, &["branch", "--list", branch])?;
+        if !existing.trim().is_empty() {
+            return Err(DomainError::Git(format!("branch already exists: {branch}")));
+        }
+
+        // E1 precondition #2: dirty base_branch check (unless override)
+        if !allow_dirty {
+            // Find which worktree has base checked out (if any)
+            let worktrees = worktree_list(repo)?;
+            let base_worktree = worktrees
+                .iter()
+                .find(|wt| wt.branch.as_deref() == Some(base));
+            if let Some(wt) = base_worktree {
+                let wt_path = std::path::Path::new(&wt.path);
+                let dirty = run_git(wt_path, &["status", "--porcelain"])?;
+                if !dirty.trim().is_empty() {
+                    return Err(DomainError::Git(format!(
+                        "base_branch has uncommitted changes: {base} at {}",
+                        wt.path
+                    )));
+                }
+            }
+        } else {
+            eprintln!(
+                "WARNING: GIT_WORKFLOW_ALLOW_DIRTY_BASE is set; skipping dirty check for base_branch '{base}'"
+            );
+        }
+
+        // ブランチ作成（base から分岐）
+        run_git(repo, &["branch", branch, base])?;
+    } else {
+        // base_branch なし: 従来通り HEAD から分岐
+        let branch_result = run_git(repo, &["branch", branch]);
+        if let Err(DomainError::Git(ref msg)) = branch_result
+            && !msg.contains("already exists")
+        {
+            return Err(branch_result.unwrap_err());
+        }
     }
 
-    // worktree作成
+    // worktree 作成
     run_git(
         repo,
         &["worktree", "add", &worktree_path.to_string_lossy(), branch],
@@ -281,9 +335,17 @@ pub fn reset(working_dir: &Path, mode: &str, target: &str) -> Result<ResetResult
 
 // ─── Merge ───────────────────────────────────────────────
 
-pub fn merge(repo: &Path, branch: &str, into_branch: &str) -> Result<MergeResult, DomainError> {
-    // 現在のブランチを確認
-    let current = run_git(repo, &["branch", "--show-current"])?;
+pub fn merge(
+    repo: &Path,
+    branch: &str,
+    into_branch: &str,
+    working_dir: Option<&Path>,
+) -> Result<MergeResult, DomainError> {
+    // E2: working_dir が指定された場合はそこで HEAD チェックと merge を実行。
+    // 省略時は repo (= repo_root) で実行する。C1 の HEAD 一致チェックは常に維持する。
+    let run_dir = working_dir.unwrap_or(repo);
+
+    let current = run_git(run_dir, &["branch", "--show-current"])?;
     if current != into_branch {
         return Err(DomainError::Git(format!(
             "must be on branch '{into_branch}' to merge, currently on '{current}'"
@@ -291,7 +353,7 @@ pub fn merge(repo: &Path, branch: &str, into_branch: &str) -> Result<MergeResult
     }
 
     let output = run_git(
-        repo,
+        run_dir,
         &[
             "merge",
             branch,
@@ -306,4 +368,329 @@ pub fn merge(repo: &Path, branch: &str, into_branch: &str) -> Result<MergeResult
         into_branch: into_branch.to_string(),
         summary: output,
     })
+}
+
+// ─── Unit tests ──────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command as StdCommand;
+    use tempfile::TempDir;
+
+    /// テスト用の git リポジトリを初期化し、initial commit を作成する。
+    fn init_repo() -> TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path();
+        StdCommand::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .output()
+            .expect("git init");
+        StdCommand::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(path)
+            .output()
+            .expect("git config email");
+        StdCommand::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(path)
+            .output()
+            .expect("git config name");
+        std::fs::write(path.join("README.md"), "# test").unwrap();
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(path)
+            .output()
+            .expect("git add");
+        StdCommand::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(path)
+            .output()
+            .expect("git commit");
+        dir
+    }
+
+    /// ディレクトリ内でファイルを追加して commit する。
+    fn add_commit(dir: &Path, filename: &str, content: &str, msg: &str) {
+        std::fs::write(dir.join(filename), content).unwrap();
+        StdCommand::new("git")
+            .args(["add", "."])
+            .current_dir(dir)
+            .output()
+            .expect("git add");
+        StdCommand::new("git")
+            .args(["commit", "-m", msg])
+            .current_dir(dir)
+            .output()
+            .expect("git commit");
+    }
+
+    // ── E1: base_branch 指定時に正しく分岐されること ──────────
+
+    #[test]
+    fn test_worktree_add_with_base_branch_branches_correctly() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // base branch を作成して commit を追加
+        StdCommand::new("git")
+            .args(["branch", "base/test"])
+            .current_dir(repo_path)
+            .output()
+            .expect("git branch");
+
+        let result = worktree_add(repo_path, "wt-base", "task/from-base", Some("base/test"));
+        assert!(
+            result.is_ok(),
+            "worktree_add with base_branch should succeed: {:?}",
+            result
+        );
+
+        // 作成された worktree が base branch の履歴を持つことを確認
+        let wt_path = repo_path.join(".worktrees").join("wt-base");
+        let log_out = StdCommand::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(&wt_path)
+            .output()
+            .expect("git log");
+        let log_text = String::from_utf8_lossy(&log_out.stdout);
+        assert!(
+            log_text.contains("initial"),
+            "worktree should contain initial commit, got: {log_text}"
+        );
+    }
+
+    // ── E1: 存在しない base_branch 指定時のエラー ──────────
+
+    #[test]
+    fn test_worktree_add_nonexistent_base_branch_errors() {
+        let repo = init_repo();
+        let result = worktree_add(
+            repo.path(),
+            "wt-bad",
+            "task/bad",
+            Some("nonexistent/branch"),
+        );
+        assert!(result.is_err(), "nonexistent base_branch should error");
+    }
+
+    // ── E1: 既存 branch 衝突時はエラー ───────────────────────
+
+    #[test]
+    fn test_worktree_add_branch_collision_errors() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // 先に base/topic を作成
+        StdCommand::new("git")
+            .args(["branch", "base/topic"])
+            .current_dir(repo_path)
+            .output()
+            .expect("git branch");
+
+        // task/collision を事前に作成
+        StdCommand::new("git")
+            .args(["branch", "task/collision"])
+            .current_dir(repo_path)
+            .output()
+            .expect("git branch");
+
+        let result = worktree_add(repo_path, "wt-coll", "task/collision", Some("base/topic"));
+        assert!(result.is_err(), "branch collision should error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("branch already exists"),
+            "error should mention 'branch already exists', got: {err_msg}"
+        );
+    }
+
+    // ── E1: base_branch が他 worktree で dirty の場合デフォルトでエラー ──
+    // worktree_add_impl を allow_dirty=false で直接呼ぶことで ENV 変更なしにテスト
+
+    #[test]
+    fn test_worktree_add_dirty_base_branch_errors_by_default() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // topic/dirty を worktree として作成
+        worktree_add_impl(repo_path, "topic-dirty", "topic/dirty", None, false)
+            .expect("create topic worktree");
+
+        // topic/dirty worktree に未コミット変更を置く
+        let dirty_wt = repo_path.join(".worktrees").join("topic-dirty");
+        std::fs::write(dirty_wt.join("dirty_file.txt"), "dirty").unwrap();
+
+        let result = worktree_add_impl(
+            repo_path,
+            "subtask-from-dirty",
+            "task/from-dirty",
+            Some("topic/dirty"),
+            false,
+        );
+        assert!(result.is_err(), "dirty base_branch should error by default");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("uncommitted changes"),
+            "error should mention uncommitted changes, got: {err_msg}"
+        );
+    }
+
+    // ── E1: allow_dirty=true で dirty でも通過 ──
+    // worktree_add_impl を allow_dirty=true で直接呼ぶことで ENV 変更なしにテスト
+
+    #[test]
+    fn test_worktree_add_dirty_base_branch_allowed_by_env() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        worktree_add_impl(repo_path, "topic-dirty2", "topic/dirty2", None, false)
+            .expect("create topic worktree");
+
+        let dirty_wt = repo_path.join(".worktrees").join("topic-dirty2");
+        std::fs::write(dirty_wt.join("dirty_file2.txt"), "dirty").unwrap();
+
+        let result = worktree_add_impl(
+            repo_path,
+            "subtask-from-dirty2",
+            "task/from-dirty2",
+            Some("topic/dirty2"),
+            true, // allow_dirty = GIT_WORKFLOW_ALLOW_DIRTY_BASE=1 相当
+        );
+        assert!(
+            result.is_ok(),
+            "allow_dirty=true should allow dirty base, got: {:?}",
+            result
+        );
+    }
+
+    // ── E1: base_branch がどの worktree にも checkout されていない場合は dirty チェックをスキップ ──
+
+    #[test]
+    fn test_worktree_add_base_branch_not_checked_out_skips_dirty_check() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // base-only は worktree なしで ref のみ作成
+        StdCommand::new("git")
+            .args(["branch", "base/ref-only"])
+            .current_dir(repo_path)
+            .output()
+            .expect("git branch");
+
+        // allow_dirty=false でも base が checkout されていなければ dirty チェックをスキップ
+        let result = worktree_add_impl(
+            repo_path,
+            "wt-from-ref",
+            "task/from-ref",
+            Some("base/ref-only"),
+            false,
+        );
+        assert!(
+            result.is_ok(),
+            "base_branch not checked out should skip dirty check and succeed: {:?}",
+            result
+        );
+    }
+
+    // ── E1: base_branch が別 worktree で checkout されていても分岐できること ──
+
+    #[test]
+    fn test_worktree_add_base_branch_in_another_worktree() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // topic/shared を worktree として作成（clean）
+        worktree_add_impl(repo_path, "topic-shared", "topic/shared", None, false)
+            .expect("create topic/shared worktree");
+
+        // topic/shared worktree は clean のまま → subtask 作成は成功するはず
+        let result = worktree_add_impl(
+            repo_path,
+            "subtask-from-shared",
+            "task/from-shared",
+            Some("topic/shared"),
+            false,
+        );
+        assert!(
+            result.is_ok(),
+            "clean base_branch in worktree should allow worktree_add: {:?}",
+            result
+        );
+    }
+
+    // ── E2: merge に working_dir を渡して worktree で merge できること ──
+
+    #[test]
+    fn test_merge_with_working_dir_succeeds() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // topic worktree を作成
+        worktree_add(repo_path, "topic-mt", "topic/mt", None).expect("topic worktree");
+
+        // subtask worktree を topic から分岐
+        worktree_add(repo_path, "subtask-mt", "task/subtask-mt", Some("topic/mt"))
+            .expect("subtask worktree");
+
+        // subtask worktree に commit を追加
+        let subtask_path = repo_path.join(".worktrees").join("subtask-mt");
+        add_commit(&subtask_path, "st_file.txt", "st content", "st commit");
+
+        // topic worktree を working_dir として merge
+        let topic_path = repo_path.join(".worktrees").join("topic-mt");
+        let result = merge(repo_path, "task/subtask-mt", "topic/mt", Some(&topic_path));
+        assert!(
+            result.is_ok(),
+            "merge with working_dir should succeed: {:?}",
+            result
+        );
+
+        // topic worktree に st commit が存在することを確認
+        let log_out = StdCommand::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(&topic_path)
+            .output()
+            .expect("git log");
+        let log_text = String::from_utf8_lossy(&log_out.stdout);
+        assert!(
+            log_text.contains("st commit"),
+            "topic should contain st commit after merge, got: {log_text}"
+        );
+    }
+
+    // ── E2: working_dir 指定で HEAD 不一致ならエラー ────────
+
+    #[test]
+    fn test_merge_with_working_dir_head_mismatch_errors() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        worktree_add(repo_path, "topic-ma", "topic/ma", None).expect("topic-ma");
+        worktree_add(repo_path, "topic-mb", "topic/mb", None).expect("topic-mb");
+
+        let topic_a_path = repo_path.join(".worktrees").join("topic-ma");
+        // topic-a の worktree を指定して into_branch = topic/mb（HEAD は topic/ma）
+        let result = merge(repo_path, "topic/mb", "topic/mb", Some(&topic_a_path));
+        assert!(result.is_err(), "HEAD mismatch should error");
+    }
+
+    // ── E2: working_dir 省略時は repo_root で HEAD チェック ──
+
+    #[test]
+    fn test_merge_without_working_dir_uses_repo_root() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        worktree_add(repo_path, "feat-compat", "task/compat-ut", None).expect("feat worktree");
+        let feat_path = repo_path.join(".worktrees").join("feat-compat");
+        add_commit(&feat_path, "compat.txt", "compat", "compat commit");
+
+        // repo_root の HEAD は main/master なので task/compat-ut は不一致 → エラー
+        let result = merge(repo_path, "task/compat-ut", "task/compat-ut", None);
+        assert!(
+            result.is_err(),
+            "merge without working_dir should check repo root HEAD"
+        );
+    }
 }

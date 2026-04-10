@@ -19,6 +19,8 @@ struct WorktreeAddRequest {
     name: String,
     /// Branch name to create (e.g. "task/my-feature")
     branch: String,
+    /// Base branch to branch from (e.g. "topic/foo"). If omitted, branches from repo HEAD.
+    base_branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -47,6 +49,8 @@ struct MergeRequest {
     branch: String,
     /// Branch to merge into (must be current branch)
     into_branch: String,
+    /// Working directory to run merge in (e.g. a worktree path). If omitted, uses repo root.
+    working_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -140,8 +144,13 @@ impl GitWorkflowServer {
         Parameters(req): Parameters<WorktreeAddRequest>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let repo_root = self.repo_root().await?;
-        let path =
-            git::worktree_add(&repo_root, &req.name, &req.branch).map_err(Self::to_mcp_error)?;
+        let path = git::worktree_add(
+            &repo_root,
+            &req.name,
+            &req.branch,
+            req.base_branch.as_deref(),
+        )
+        .map_err(Self::to_mcp_error)?;
 
         let store = self.session_store().await?;
         store
@@ -322,8 +331,9 @@ impl GitWorkflowServer {
             ));
         }
 
-        let result =
-            git::merge(&repo_root, &req.branch, &req.into_branch).map_err(Self::to_mcp_error)?;
+        let working_dir = req.working_dir.as_deref().map(std::path::Path::new);
+        let result = git::merge(&repo_root, &req.branch, &req.into_branch, working_dir)
+            .map_err(Self::to_mcp_error)?;
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             format!(
