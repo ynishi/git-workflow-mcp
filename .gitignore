@@ -1,3 +1,4 @@
-/target
-/workspace
-/.worktrees
+target
+workspace
+.worktrees
+.ryo
