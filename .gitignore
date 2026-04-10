@@ -2,3 +2,4 @@ target
 workspace
 .worktrees
 .ryo
+.claude
