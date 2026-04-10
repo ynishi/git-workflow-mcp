@@ -22,6 +22,53 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String, DomainError> {
 
 // ─── Worktree ────────────────────────────────────────────
 
+/// Checks whether a local branch `branch` exists in `repo`.
+///
+/// Uses `git show-ref --verify --quiet refs/heads/<branch>` for exact-match
+/// semantics, avoiding glob interpretation of `git branch --list <pattern>`.
+fn branch_exists(repo: &Path, branch: &str) -> Result<bool, DomainError> {
+    let output = Command::new("git")
+        .args(["-C", &repo.to_string_lossy()])
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .output()?;
+    Ok(output.status.success())
+}
+
+/// Creates a new git worktree under `{repo}/.worktrees/{worktree_name}` on a new `branch`.
+///
+/// # Parameters
+///
+/// - `base_branch`: when `Some(base)`, the new `branch` is created from `base`
+///   (equivalent to `git branch <new> <base>`). When `None`, the branch is
+///   created from the current `HEAD` of `repo`.
+///
+/// # Preconditions (fail-fast)
+///
+/// Applied regardless of `base_branch` being set:
+///
+/// 1. `{repo}/.worktrees/{worktree_name}` does not exist.
+/// 2. `branch` does not yet exist as a local branch (exact-match via `show-ref`).
+///
+/// Applied only when `base_branch` is `Some`:
+///
+/// 3. If `base_branch` is currently checked out in some worktree (main repo or
+///    any linked worktree), that worktree must be clean (`git status --porcelain`
+///    empty). This is a **best-effort** check:
+///    - If `base_branch` is not checked out anywhere, the check is skipped
+///      (a non-checked-out ref cannot be dirty by definition).
+///    - There is an inherent TOCTOU window between the check and the subsequent
+///      `git branch` command; callers must not rely on this as a strong invariant.
+///    - The check can be bypassed entirely by setting environment variable
+///      `GIT_WORKFLOW_ALLOW_DIRTY_BASE=1` (or `true`/`yes`).
+///
+/// # Returns
+///
+/// The absolute path of the created worktree as a `String`.
 pub fn worktree_add(
     repo: &Path,
     worktree_name: &str,
@@ -50,16 +97,14 @@ fn worktree_add_impl(
         ));
     }
 
-    if let Some(base) = base_branch {
-        // E1 precondition #1: branch collision check
-        let existing = run_git(repo, &["branch", "--list", branch])?;
-        if !existing.trim().is_empty() {
-            return Err(DomainError::Git(format!("branch already exists: {branch}")));
-        }
+    // Precondition: branch collision check (applies to both Some/None base_branch).
+    if branch_exists(repo, branch)? {
+        return Err(DomainError::Git(format!("branch already exists: {branch}")));
+    }
 
-        // E1 precondition #2: dirty base_branch check (unless override)
+    if let Some(base) = base_branch {
+        // Precondition: dirty base_branch check (unless override).
         if !allow_dirty {
-            // Find which worktree has base checked out (if any)
             let worktrees = worktree_list(repo)?;
             let base_worktree = worktrees
                 .iter()
@@ -75,21 +120,17 @@ fn worktree_add_impl(
                 }
             }
         } else {
-            eprintln!(
-                "WARNING: GIT_WORKFLOW_ALLOW_DIRTY_BASE is set; skipping dirty check for base_branch '{base}'"
+            tracing::warn!(
+                base_branch = %base,
+                "GIT_WORKFLOW_ALLOW_DIRTY_BASE is set; skipping dirty check for base_branch"
             );
         }
 
         // ブランチ作成（base から分岐）
         run_git(repo, &["branch", branch, base])?;
     } else {
-        // base_branch なし: 従来通り HEAD から分岐
-        let branch_result = run_git(repo, &["branch", branch]);
-        if let Err(DomainError::Git(ref msg)) = branch_result
-            && !msg.contains("already exists")
-        {
-            return Err(branch_result.unwrap_err());
-        }
+        // base_branch なし: HEAD から分岐
+        run_git(repo, &["branch", branch])?;
     }
 
     // worktree 作成
@@ -335,14 +376,33 @@ pub fn reset(working_dir: &Path, mode: &str, target: &str) -> Result<ResetResult
 
 // ─── Merge ───────────────────────────────────────────────
 
+/// Merges `branch` into `into_branch` using `git merge --no-ff`.
+///
+/// # Parameters
+///
+/// - `working_dir`: when `Some(path)`, the HEAD-match precondition and the
+///   `git merge` command are executed with `path` as the working directory
+///   (typically a linked worktree). When `None`, they run in `repo` (repo root).
+///
+/// # Preconditions
+///
+/// 1. If `working_dir` is `Some`, the path must exist and be a directory.
+/// 2. The current branch of the resolved working directory must equal
+///    `into_branch` (the C1 HEAD-match safety check).
 pub fn merge(
     repo: &Path,
     branch: &str,
     into_branch: &str,
     working_dir: Option<&Path>,
 ) -> Result<MergeResult, DomainError> {
-    // E2: working_dir が指定された場合はそこで HEAD チェックと merge を実行。
-    // 省略時は repo (= repo_root) で実行する。C1 の HEAD 一致チェックは常に維持する。
+    if let Some(wd) = working_dir
+        && !wd.is_dir()
+    {
+        return Err(DomainError::Git(format!(
+            "working_dir does not exist or is not a directory: {}",
+            wd.display()
+        )));
+    }
     let run_dir = working_dir.unwrap_or(repo);
 
     let current = run_git(run_dir, &["branch", "--show-current"])?;
@@ -383,7 +443,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path();
         StdCommand::new("git")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(path)
             .output()
             .expect("git init");
