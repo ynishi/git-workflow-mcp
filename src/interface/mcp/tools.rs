@@ -33,6 +33,11 @@ struct WorktreeRemoveRequest {
 struct BranchDeleteRequest {
     /// Branch name to delete
     branch: String,
+    /// Working directory to run `git branch -d` in (e.g. a worktree path whose HEAD
+    /// contains the branch's commits). If omitted, uses repo root. Required when the
+    /// branch is only merged into a non-default HEAD such as a topic worktree, because
+    /// `git branch -d`'s merge safety check is evaluated against the running directory's HEAD.
+    working_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -271,7 +276,8 @@ impl GitWorkflowServer {
             ));
         }
 
-        git::branch_delete(&repo_root, &req.branch).map_err(Self::to_mcp_error)?;
+        let working_dir = req.working_dir.as_deref().map(std::path::Path::new);
+        git::branch_delete(&repo_root, &req.branch, working_dir).map_err(Self::to_mcp_error)?;
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             format!("Branch '{}' deleted.", req.branch),

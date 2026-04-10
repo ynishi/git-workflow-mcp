@@ -197,8 +197,36 @@ pub fn worktree_list(repo: &Path) -> Result<Vec<Worktree>, DomainError> {
 
 // ─── Branch ──────────────────────────────────────────────
 
-pub fn branch_delete(repo: &Path, branch: &str) -> Result<(), DomainError> {
-    run_git(repo, &["branch", "-d", branch]).map_err(|e| match e {
+/// Deletes a local branch with `git branch -d` (safety check preserved).
+///
+/// # Parameters
+///
+/// - `working_dir`: when `Some(path)`, `git branch -d` is executed with `path`
+///   as the working directory (typically a linked worktree). This is required
+///   when the branch has been merged only into a non-default HEAD (e.g. a topic
+///   worktree), because `git branch -d`'s merge check is evaluated against the
+///   current HEAD of the running directory. When `None`, the command runs in
+///   `repo` (repo root) for backward compatibility.
+///
+/// # Preconditions
+///
+/// If `working_dir` is `Some`, the path must exist and be a directory.
+pub fn branch_delete(
+    repo: &Path,
+    branch: &str,
+    working_dir: Option<&Path>,
+) -> Result<(), DomainError> {
+    if let Some(wd) = working_dir
+        && !wd.is_dir()
+    {
+        return Err(DomainError::Git(format!(
+            "working_dir does not exist or is not a directory: {}",
+            wd.display()
+        )));
+    }
+    let run_dir = working_dir.unwrap_or(repo);
+
+    run_git(run_dir, &["branch", "-d", branch]).map_err(|e| match e {
         DomainError::Git(msg) if msg.contains("not found") => {
             DomainError::BranchNotFound(branch.to_string())
         }
@@ -733,6 +761,93 @@ mod tests {
         // topic-a の worktree を指定して into_branch = topic/mb（HEAD は topic/ma）
         let result = merge(repo_path, "topic/mb", "topic/mb", Some(&topic_a_path));
         assert!(result.is_err(), "HEAD mismatch should error");
+    }
+
+    // ── E3: branch_delete に working_dir を渡して topic worktree で削除できること ──
+
+    #[test]
+    fn test_branch_delete_with_working_dir_succeeds() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // topic worktree を作成し、そこに subtask branch を分岐
+        worktree_add(repo_path, "topic-bd", "topic/bd", None).expect("topic worktree");
+        worktree_add(repo_path, "subtask-bd", "task/subtask-bd", Some("topic/bd"))
+            .expect("subtask worktree");
+
+        let subtask_path = repo_path.join(".worktrees").join("subtask-bd");
+        add_commit(&subtask_path, "bd.txt", "bd", "bd commit");
+
+        // subtask を topic に merge（topic worktree から）
+        let topic_path = repo_path.join(".worktrees").join("topic-bd");
+        merge(repo_path, "task/subtask-bd", "topic/bd", Some(&topic_path)).expect("merge");
+
+        // subtask worktree を remove してから branch_delete
+        worktree_remove(repo_path, "subtask-bd").expect("worktree remove");
+
+        // repo root (HEAD=main) では subtask branch は未 merge と判定される → エラーになるはず
+        let fail = branch_delete(repo_path, "task/subtask-bd", None);
+        assert!(
+            fail.is_err(),
+            "branch_delete at repo root should fail because HEAD=main has no subtask commits"
+        );
+
+        // topic worktree を working_dir に指定すれば成功する
+        let ok = branch_delete(repo_path, "task/subtask-bd", Some(&topic_path));
+        assert!(
+            ok.is_ok(),
+            "branch_delete with topic working_dir should succeed: {:?}",
+            ok
+        );
+    }
+
+    // ── E3: working_dir 指定で未 merge branch は削除できないこと ──
+
+    #[test]
+    fn test_branch_delete_with_working_dir_not_merged_errors() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        worktree_add(repo_path, "topic-bu", "topic/bu", None).expect("topic worktree");
+        worktree_add(repo_path, "subtask-bu", "task/subtask-bu", Some("topic/bu"))
+            .expect("subtask worktree");
+
+        let subtask_path = repo_path.join(".worktrees").join("subtask-bu");
+        add_commit(&subtask_path, "bu.txt", "bu", "bu commit");
+
+        // 未 merge のまま subtask worktree を remove
+        worktree_remove(repo_path, "subtask-bu").expect("worktree remove");
+
+        // topic worktree を working_dir に指定しても subtask は未 merge なので削除不可
+        let topic_path = repo_path.join(".worktrees").join("topic-bu");
+        let result = branch_delete(repo_path, "task/subtask-bu", Some(&topic_path));
+        assert!(
+            result.is_err(),
+            "branch_delete of not-fully-merged branch should fail"
+        );
+    }
+
+    // ── E3: working_dir 省略時は repo_root で動作（後方互換） ──
+
+    #[test]
+    fn test_branch_delete_without_working_dir_uses_repo_root() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // main から直接分岐 → main に merge 可能な branch を作る
+        StdCommand::new("git")
+            .args(["branch", "feat/compat-bd"])
+            .current_dir(repo_path)
+            .output()
+            .expect("git branch");
+
+        // main HEAD と同一 commit を指しているので --merged 判定は通る
+        let result = branch_delete(repo_path, "feat/compat-bd", None);
+        assert!(
+            result.is_ok(),
+            "branch_delete without working_dir should work on repo root: {:?}",
+            result
+        );
     }
 
     // ── E2: working_dir 省略時は repo_root で HEAD チェック ──
