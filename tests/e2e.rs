@@ -105,6 +105,7 @@ async fn test_list_tools() {
     assert!(tool_names.contains(&"diff"));
     assert!(tool_names.contains(&"log"));
     assert!(tool_names.contains(&"safe_reset"));
+    assert!(tool_names.contains(&"session_release"));
 
     let mut tool_summary: Vec<Value> = tools
         .iter()
@@ -1186,6 +1187,86 @@ async fn test_merge_without_working_dir() {
     );
 
     client.cancel().await.unwrap();
+}
+
+// ─── session_release tests ────────────────────────────────
+
+#[tokio::test]
+async fn test_session_release_allows_other_session() {
+    let repo = TempRepo::new();
+
+    // Session A: create orphan worktree, then disconnect
+    {
+        let client_a = connect().await;
+
+        client_a
+            .peer()
+            .call_tool(call_params(
+                "session_start",
+                json!({ "repo_root": repo.path_str() }),
+            ))
+            .await
+            .unwrap();
+
+        let result = client_a
+            .peer()
+            .call_tool(call_params(
+                "worktree_add",
+                json!({ "name": "orphan", "branch": "task/orphan" }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            extract_text(&result).contains("Worktree created."),
+            "session A: worktree_add should succeed"
+        );
+
+        client_a.cancel().await.unwrap();
+    }
+
+    // Session B: different session — worktree_remove should fail (SessionMismatch)
+    let client_b = connect().await;
+
+    client_b
+        .peer()
+        .call_tool(call_params(
+            "session_start",
+            json!({ "repo_root": repo.path_str() }),
+        ))
+        .await
+        .unwrap();
+
+    let remove_before_release = client_b
+        .peer()
+        .call_tool(call_params("worktree_remove", json!({ "name": "orphan" })))
+        .await;
+    assert!(
+        remove_before_release.is_err(),
+        "worktree_remove from a different session should fail before session_release"
+    );
+
+    // session_release should succeed
+    let release_result = client_b
+        .peer()
+        .call_tool(call_params("session_release", json!({ "name": "orphan" })))
+        .await
+        .unwrap();
+    assert!(
+        extract_text(&release_result).contains("Session ownership released for worktree 'orphan'."),
+        "session_release should succeed"
+    );
+
+    // worktree_remove should now succeed
+    let remove_after_release = client_b
+        .peer()
+        .call_tool(call_params("worktree_remove", json!({ "name": "orphan" })))
+        .await;
+    assert!(
+        remove_after_release.is_ok(),
+        "worktree_remove should succeed after session_release"
+    );
+
+    client_b.cancel().await.unwrap();
 }
 
 // ─── Helpers ──────────────────────────────────────────────
