@@ -16,6 +16,7 @@ MCP server providing session-guarded git worktree management for AI agent pipeli
 | `worktree_list` | List all worktrees with ownership info | Yes |
 | `branch_delete` | Delete a merged branch (owner session only) | Yes |
 | `merge` | Merge a branch into target (owner session only) | Yes |
+| `session_release` | Release session ownership of an orphan worktree | Yes |
 | `commit` | Stage all changes and commit | No |
 | `status` | Show git status | No |
 | `diff` | Show git diff (stat + patch) | No |

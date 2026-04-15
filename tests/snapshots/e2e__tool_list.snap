@@ -28,6 +28,10 @@ expression: tool_summary
     "name": "safe_reset"
   },
   {
+    "description": "Release session ownership of a worktree, allowing another session to perform cleanup (merge / worktree_remove). Useful when the original session ended and a new session needs to complete cleanup. Requires session_start.",
+    "name": "session_release"
+  },
+  {
     "description": "Initialize the session with a git repository root. Must be called before using any repository-scoped tools (worktree_*, branch_delete, merge). Returns the session ID.",
     "name": "session_start"
   },

@@ -22,6 +22,7 @@ use crate::infra::session_store::SessionStore;
 const WRITE_TOOLS: &[&str] = &[
     "commit",
     "merge",
+    "session_release",
     "worktree_add",
     "worktree_remove",
     "branch_delete",
@@ -90,7 +91,9 @@ impl ServerHandler for GitWorkflowServer {
              Destructive operations (worktree_remove, branch_delete, merge) \
              only work on worktrees created by the same session.\n\
              \n\
-             Workflow: session_start → worktree_add → (work) → commit → merge → worktree_remove → branch_delete";
+             Workflow: session_start → worktree_add → (work) → commit → merge → worktree_remove → branch_delete\n\
+             \n\
+             session_release: take ownership of an orphan worktree from a previous session";
 
         let instructions = if self.mode == ServerMode::ReadOnly {
             format!(
