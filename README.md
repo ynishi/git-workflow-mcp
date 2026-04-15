@@ -28,6 +28,21 @@ MCP server providing session-guarded git worktree management for AI agent pipeli
 session_start → worktree_add → (work) → commit → merge → worktree_remove → branch_delete
 ```
 
+## Orphan Worktree Recovery
+
+When an MCP session ends unexpectedly (e.g. a crash or timeout), the worktree it created remains registered under the original session ID. A new session cannot run `merge`, `worktree_remove`, or `branch_delete` on that worktree because session ownership does not match.
+
+Use `session_release` to remove the ownership entry and unblock the new session:
+
+```
+# New session
+session_start(repo_root)
+session_release(name: "<worktree-name>")   # drops orphan ownership entry
+worktree_remove / merge / branch_delete    # now succeeds
+```
+
+`session_release` is idempotent — calling it for an already-released or non-existent name always succeeds.
+
 ## Installation
 
 ```bash
