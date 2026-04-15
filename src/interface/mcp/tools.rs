@@ -100,6 +100,12 @@ struct SafeResetRequest {
     target: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SessionReleaseRequest {
+    /// Worktree name to release ownership of
+    name: String,
+}
+
 // ─── Tools ───────────────────────────────────────────────
 
 #[tool_router(vis = "pub(super)")]
@@ -196,6 +202,28 @@ impl GitWorkflowServer {
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             format!("Worktree '{}' removed.", req.name),
+        )]))
+    }
+
+    #[tool(
+        name = "session_release",
+        description = "Release session ownership of a worktree, allowing another session to perform cleanup (merge / worktree_remove). Useful when the original session ended and a new session needs to complete cleanup. Requires session_start.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn session_release(
+        &self,
+        Parameters(req): Parameters<SessionReleaseRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let store = self.session_store().await?;
+
+        store.unregister(&req.name).map_err(Self::to_mcp_error)?;
+
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            format!("Session ownership released for worktree '{}'.", req.name),
         )]))
     }
 
