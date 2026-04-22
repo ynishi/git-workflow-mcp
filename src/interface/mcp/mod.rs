@@ -36,11 +36,127 @@ pub enum ServerMode {
     ReadOnly,
 }
 
+/// Heartbeat 発火間隔 (秒)。debugging 目的で短めに固定。
+const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
 pub async fn run(mode: ServerMode) -> anyhow::Result<()> {
     let server = GitWorkflowServer::new(mode);
+    let session_id = server.session_id.clone();
+
+    // Heartbeat task: 起動直後に 1 発打ち、以降 30s interval で "alive" ログを出す。
+    // shutdown 時は abort で殺す (クリーンアップ不要の単純 logging loop)。
+    let heartbeat_handle = tokio::spawn(heartbeat_loop(session_id.clone()));
+
     let service = server.serve(stdio()).await?;
-    service.waiting().await?;
+
+    // Shutdown reason を 5 種に分類して log 出力する。
+    let (reason, err_detail) = wait_for_shutdown(service).await;
+
+    heartbeat_handle.abort();
+
+    match err_detail {
+        Some(e) => tracing::info!(reason, err = %e, "shutting down"),
+        None => tracing::info!(reason, "shutting down"),
+    }
+
     Ok(())
+}
+
+/// 30 秒おきに `alive pid=N sid=...` を発火する heartbeat loop。
+///
+/// 初回は即時発火 (起動直後の last-alive timestamp 確保)、以降 interval tick ごと。
+/// logging 経路の失敗は tracing が swallow する (appender buffer 溢れ等)。
+async fn heartbeat_loop(session_id: SessionId) {
+    let start = std::time::Instant::now();
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+    // interval の 1 発目は即時 fire。default がそうなっているがカラッと明示。
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        ticker.tick().await;
+        let elapsed_s = start.elapsed().as_secs();
+        tracing::info!(
+            pid = std::process::id(),
+            sid = %session_id,
+            elapsed_s,
+            "alive"
+        );
+    }
+}
+
+/// Shutdown trigger を 5 branch で多重監視する。
+///
+/// 戻り値は `(reason, err_detail)`。err_detail は `service_error` 時のみ `Some`。
+async fn wait_for_shutdown<S>(service: S) -> (&'static str, Option<String>)
+where
+    S: ServiceWaiting + Send + 'static,
+{
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        // signal stream 作成失敗は startup 時点で panic しないよう Option 扱い。
+        // 失敗時はその branch が発火しなくなるだけ (他 4 branch で拾える)。
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        let mut sigpipe = signal(SignalKind::pipe()).ok();
+
+        let waiting = service.waiting();
+        tokio::pin!(waiting);
+
+        tokio::select! {
+            r = &mut waiting => match r {
+                Ok(()) => ("stdin_eof", None),
+                Err(e) => ("service_error", Some(e)),
+            },
+            _ = tokio::signal::ctrl_c() => ("ctrl_c", None),
+            _ = async {
+                match sigterm.as_mut() {
+                    Some(s) => { s.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => ("sigterm", None),
+            _ = async {
+                match sigpipe.as_mut() {
+                    Some(s) => { s.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => ("sigpipe", None),
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // 非 Unix (Windows) では SIGTERM/SIGPIPE 相当が無いので ctrl_c と waiting のみ。
+        let waiting = service.waiting();
+        tokio::pin!(waiting);
+
+        tokio::select! {
+            r = &mut waiting => match r {
+                Ok(()) => ("stdin_eof", None),
+                Err(e) => ("service_error", Some(e)),
+            },
+            _ = tokio::signal::ctrl_c() => ("ctrl_c", None),
+        }
+    }
+}
+
+/// `service.waiting()` を抽象化する trait。rmcp の具体型に直接依存せず test 可能にする。
+trait ServiceWaiting {
+    fn waiting(self) -> impl std::future::Future<Output = Result<(), String>> + Send;
+}
+
+impl<S> ServiceWaiting for rmcp::service::RunningService<RoleServer, S>
+where
+    S: ServerHandler,
+{
+    async fn waiting(self) -> Result<(), String> {
+        // rmcp 0.15: `waiting()` は `QuitReason` を返す。Ok は正常終了 (EOF 等)、
+        // 内部 error は Err(ServiceError) で返る。to_string でフラット化。
+        match self.waiting().await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -144,13 +260,43 @@ impl ServerHandler for GitWorkflowServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        use futures::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
         if self.mode == ServerMode::ReadOnly && WRITE_TOOLS.contains(&request.name.as_ref()) {
             return Err(McpError::invalid_params(
                 format!("tool '{}' is not available in read-only mode", request.name),
                 None,
             ));
         }
+        let tool_name = request.name.to_string();
         let tool_ctx = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tool_ctx).await
+
+        // tool handler 本体を catch_unwind で囲む。単一 handler の panic で stdio transport を
+        // 死なせず、McpError::internal_error として client に返す。panic message は best-effort
+        // 抽出 (&str / String) する。
+        let result = AssertUnwindSafe(self.tool_router.call(tool_ctx))
+            .catch_unwind()
+            .await;
+
+        match result {
+            Ok(r) => r,
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                tracing::error!(
+                    tool = %tool_name,
+                    panic_msg = %msg,
+                    "tool handler panicked"
+                );
+                Err(McpError::internal_error(
+                    format!("tool '{tool_name}' panicked: {msg}"),
+                    None,
+                ))
+            }
+        }
     }
 }

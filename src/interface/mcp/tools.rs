@@ -110,6 +110,11 @@ struct SessionReleaseRequest {
 
 #[tool_router(vis = "pub(super)")]
 impl GitWorkflowServer {
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "session_start"),
+        err
+    )]
     #[tool(
         name = "session_start",
         description = "Initialize the session with a git repository root. Must be called before using any repository-scoped tools (worktree_*, branch_delete, merge). Returns the session ID.",
@@ -141,6 +146,11 @@ impl GitWorkflowServer {
         )]))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "worktree_add"),
+        err
+    )]
     #[tool(
         name = "worktree_add",
         description = "Create a new git worktree under .worktrees/ with a new branch. Requires session_start. Registers the worktree to this session for ownership tracking.",
@@ -176,6 +186,11 @@ impl GitWorkflowServer {
         )]))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "worktree_remove"),
+        err
+    )]
     #[tool(
         name = "worktree_remove",
         description = "Remove a worktree. Only the session that created it can remove it. Requires session_start.",
@@ -205,6 +220,11 @@ impl GitWorkflowServer {
         )]))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "session_release"),
+        err
+    )]
     #[tool(
         name = "session_release",
         description = "Release session ownership of a worktree, allowing another session to perform cleanup (merge / worktree_remove). Useful when the original session ended and a new session needs to complete cleanup. Requires session_start.",
@@ -227,6 +247,11 @@ impl GitWorkflowServer {
         )]))
     }
 
+    #[tracing::instrument(
+        skip(self),
+        fields(session_id = %self.session_id, tool = "worktree_list"),
+        err
+    )]
     #[tool(
         name = "worktree_list",
         description = "List all git worktrees with their session ownership info. Requires session_start.",
@@ -275,6 +300,11 @@ impl GitWorkflowServer {
         )]))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "branch_delete"),
+        err
+    )]
     #[tool(
         name = "branch_delete",
         description = "Delete a merged branch. Only allowed if the branch's worktree was created by this session. Requires session_start.",
@@ -312,6 +342,11 @@ impl GitWorkflowServer {
         )]))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "commit"),
+        err
+    )]
     #[tool(
         name = "commit",
         description = "Stage all changes and create a commit in the specified working directory. Does not require session_start.",
@@ -336,6 +371,11 @@ impl GitWorkflowServer {
         )]))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "merge"),
+        err
+    )]
     #[tool(
         name = "merge",
         description = "Merge a branch into the target branch (must be current branch). Session-guarded. Requires session_start.",
@@ -377,6 +417,11 @@ impl GitWorkflowServer {
         )]))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "status"),
+        err
+    )]
     #[tool(
         name = "status",
         description = "Show git status (branch, changed files) for a working directory. Does not require session_start.",
@@ -409,6 +454,11 @@ impl GitWorkflowServer {
         )]))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "diff"),
+        err
+    )]
     #[tool(
         name = "diff",
         description = "Show git diff for a working directory. Supports staged, commit range comparison, path filtering, name-only, and line limit. Does not require session_start.",
@@ -467,6 +517,11 @@ impl GitWorkflowServer {
         )]))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "log"),
+        err
+    )]
     #[tool(
         name = "log",
         description = "Show git log (commit history) for a working directory. Does not require session_start.",
@@ -500,6 +555,11 @@ impl GitWorkflowServer {
         )]))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "safe_reset"),
+        err
+    )]
     #[tool(
         name = "safe_reset",
         description = "Safely reset HEAD to a target commit. Only supports 'soft' (move HEAD, keep staged and working tree) and 'mixed' (move HEAD, unstage changes, keep working tree) modes. Hard reset is intentionally not supported. Returns the previous HEAD hash for recovery. Does not require session_start.",

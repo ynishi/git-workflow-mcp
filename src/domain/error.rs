@@ -23,4 +23,7 @@ pub enum DomainError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("file lock error: {0}")]
+    Lock(String),
 }

@@ -3,3 +3,4 @@ workspace
 .worktrees
 .ryo
 .claude
+.mcp.json

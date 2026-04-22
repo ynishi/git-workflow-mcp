@@ -3,7 +3,8 @@ mod infra;
 mod interface;
 
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
+
+use infra::observability::{init_observability, resolve_log_dir, resolve_log_level};
 
 #[derive(Parser)]
 #[command(name = "git-workflow-mcp", version)]
@@ -12,9 +13,11 @@ struct Cli {
     #[arg(long, default_value = "full")]
     mode: CliMode,
 
-    /// Log level filter (e.g. "info", "debug", "git_workflow_mcp=trace")
-    #[arg(long, env = "RUST_LOG", default_value = "warn")]
-    log_level: String,
+    /// Log level filter (e.g. "info", "debug", "git_workflow_mcp=trace").
+    ///
+    /// Priority: `--log-level` > `GIT_WORKFLOW_LOG_LEVEL` > `RUST_LOG` > `"warn"`.
+    #[arg(long)]
+    log_level: Option<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -36,10 +39,19 @@ impl From<CliMode> for interface::mcp::ServerMode {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(&cli.log_level))
-        .with_writer(std::io::stderr)
-        .init();
+    let log_dir = resolve_log_dir();
+    let level = resolve_log_level(cli.log_level.as_deref());
+
+    // Observability 初期化。WorkerGuard を drop すると non_blocking writer が
+    // flush 前に shutdown するため、`_guard` として main() scope 末尾まで保持する。
+    let _guard = init_observability(&log_dir, &level)?;
+
+    tracing::info!(
+        log_dir = %log_dir.display(),
+        level = %level,
+        pid = %std::process::id(),
+        "git-workflow-mcp starting"
+    );
 
     interface::mcp::run(cli.mode.into()).await
 }

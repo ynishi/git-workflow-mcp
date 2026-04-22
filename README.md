@@ -64,6 +64,16 @@ Add to your MCP client configuration (e.g. Claude Code `settings.json`):
 }
 ```
 
+## Observability
+
+The server writes structured logs to both stderr and a rolling file, useful for diagnosing disconnects or hangs after the fact.
+
+- **Logs**: written to `$GIT_WORKFLOW_LOG_DIR` (default `~/.cache/git-workflow-mcp/`) as `mcp.YYYY-MM-DD.log` (daily rotation).
+- **Panic backtrace**: on any thread panic, the backtrace is appended to `panic.log` in the same directory.
+- **Log level**: `--log-level` CLI arg > `GIT_WORKFLOW_LOG_LEVEL` env > `RUST_LOG` env > `warn` default. Accepts [`EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax (e.g. `git_workflow_mcp=debug`).
+- **Heartbeat**: an `alive pid=... sid=... elapsed_s=...` info line every 30 seconds, so the last-alive timestamp is always within half a minute of a crash.
+- **Shutdown reason**: on exit a single `shutting down reason=<kind>` line is emitted. Kinds: `stdin_eof` (transport closed normally), `service_error` (rmcp returned error), `sigterm`, `sigpipe`, `ctrl_c`.
+
 ## License
 
 Licensed under either of
