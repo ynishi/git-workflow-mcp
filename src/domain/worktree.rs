@@ -54,3 +54,14 @@ pub struct ResetResult {
     /// "soft" or "mixed"
     pub mode: String,
 }
+
+/// `git remote -v` の1エントリ。
+// Used by infra::git::remote_list; wired to interface layer in Subtask 2.
+#[allow(dead_code)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RemoteEntry {
+    pub name: String,
+    pub url: String,
+    /// "fetch" または "push"
+    pub direction: String,
+}

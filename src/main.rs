@@ -24,6 +24,7 @@ struct Cli {
 enum CliMode {
     Full,
     ReadOnly,
+    ReadRemote,
 }
 
 impl From<CliMode> for interface::mcp::ServerMode {
@@ -31,6 +32,7 @@ impl From<CliMode> for interface::mcp::ServerMode {
         match m {
             CliMode::Full => interface::mcp::ServerMode::Full,
             CliMode::ReadOnly => interface::mcp::ServerMode::ReadOnly,
+            CliMode::ReadRemote => interface::mcp::ServerMode::ReadRemote,
         }
     }
 }

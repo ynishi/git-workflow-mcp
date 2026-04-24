@@ -3,7 +3,7 @@ use std::process::Command;
 
 use crate::domain::error::DomainError;
 use crate::domain::worktree::{
-    CommitResult, DiffResult, LogEntry, MergeResult, RepoStatus, ResetResult, Worktree,
+    CommitResult, DiffResult, LogEntry, MergeResult, RemoteEntry, RepoStatus, ResetResult, Worktree,
 };
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String, DomainError> {
@@ -491,6 +491,112 @@ pub fn merge(
     })
 }
 
+// ─── Remote / Fetch ──────────────────────────────────────
+
+/// Validates that `s` is a safe remote name (allowlist).
+///
+/// Allowed characters: ASCII alphanumeric, `/`, `.`, `_`, `-`.
+/// Empty strings are rejected.
+// Called by fetch(); also used directly from interface layer in Subtask 2.
+pub fn validate_remote_name(s: &str) -> Result<(), DomainError> {
+    if s.is_empty()
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+    {
+        return Err(DomainError::Git(format!("invalid remote name: {s}")));
+    }
+    Ok(())
+}
+
+/// Validates that `s` is a safe git refspec (allowlist).
+///
+/// Allowed characters: ASCII alphanumeric, `/`, `.`, `_`, `-`, `*`, `+`, `~`, `^`, `:`.
+/// Empty strings are rejected.
+// Called by fetch(); also used directly from interface layer in Subtask 2.
+pub fn validate_refspec(s: &str) -> Result<(), DomainError> {
+    if s.is_empty()
+        || !s.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '/' | '.' | '_' | '-' | '*' | '+' | '~' | '^' | ':')
+        })
+    {
+        return Err(DomainError::Git(format!("invalid refspec: {s}")));
+    }
+    Ok(())
+}
+
+/// Runs `git fetch` against `repo`.
+///
+/// - `remote`: remote name (default: `"origin"`). Validated via `validate_remote_name`.
+/// - `refspec`: optional refspec. Validated via `validate_refspec`.
+/// - `prune`: when `true`, adds `--prune` to delete stale tracking refs.
+///
+/// Returns the trimmed stdout of the fetch command.
+// Wired to interface layer (tools.rs) in Subtask 2.
+pub fn fetch(
+    repo: &Path,
+    remote: Option<&str>,
+    refspec: Option<&str>,
+    prune: bool,
+) -> Result<String, DomainError> {
+    if let Some(r) = remote {
+        validate_remote_name(r)?;
+    }
+    if let Some(rs) = refspec {
+        validate_refspec(rs)?;
+    }
+
+    // Build args. `run_git` takes `&[&str]`, so String values must be bound to
+    // stack variables before taking a `&str` slice — same pattern as `diff`'s
+    // `range_owned`.
+    let remote_owned = remote.unwrap_or("origin").to_string();
+    let refspec_owned: Option<String> = refspec.map(|s| s.to_string());
+
+    let mut args: Vec<&str> = vec!["fetch"];
+    if prune {
+        args.push("--prune");
+    }
+    args.push(remote_owned.as_str());
+    if let Some(ref rs) = refspec_owned {
+        args.push(rs.as_str());
+    }
+
+    run_git(repo, &args)
+}
+
+/// Lists remotes via `git remote -v`.
+///
+/// Each output line has the format `<name>\t<url> (fetch|push)`.
+/// Lines that cannot be parsed are silently skipped; an empty repository
+/// returns an empty `Vec`.
+// Wired to interface layer (tools.rs) in Subtask 2.
+pub fn remote_list(repo: &Path) -> Result<Vec<RemoteEntry>, DomainError> {
+    let output = run_git(repo, &["remote", "-v"])?;
+    let mut entries = Vec::new();
+    for line in output.lines() {
+        // Expected: "origin\thttps://example.com/repo.git (fetch)"
+        let Some((name, rest)) = line.split_once('\t') else {
+            continue;
+        };
+        // rest: "https://example.com/repo.git (fetch)"
+        let Some((url_part, direction_part)) = rest.rsplit_once(' ') else {
+            continue;
+        };
+        // direction_part: "(fetch)" or "(push)"
+        let direction = direction_part.trim_start_matches('(').trim_end_matches(')');
+        if direction.is_empty() {
+            continue;
+        }
+        entries.push(RemoteEntry {
+            name: name.to_string(),
+            url: url_part.to_string(),
+            direction: direction.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
 // ─── Unit tests ──────────────────────────────────────────
 
 #[cfg(test)]
@@ -937,5 +1043,49 @@ mod tests {
             result.is_err(),
             "merge without working_dir should check repo root HEAD"
         );
+    }
+
+    // ── validate_remote_name ──────────────────────────────
+
+    #[test]
+    fn test_validate_remote_name_accept() {
+        for name in &["origin", "upstream-1", "my.remote/sub"] {
+            assert!(validate_remote_name(name).is_ok(), "should accept: {name}");
+        }
+    }
+
+    #[test]
+    fn test_validate_remote_name_reject() {
+        for name in &["a; rm -rf", "origin b", ""] {
+            let result = validate_remote_name(name);
+            assert!(result.is_err(), "should reject: {name:?}");
+            let msg = format!("{:?}", result.unwrap_err());
+            assert!(
+                msg.contains("invalid remote name"),
+                "error should mention 'invalid remote name': {msg}"
+            );
+        }
+    }
+
+    // ── validate_refspec ──────────────────────────────────
+
+    #[test]
+    fn test_validate_refspec_accept() {
+        for spec in &["refs/heads/main", "+refs/heads/*:refs/remotes/origin/*"] {
+            assert!(validate_refspec(spec).is_ok(), "should accept: {spec}");
+        }
+    }
+
+    #[test]
+    fn test_validate_refspec_reject() {
+        for spec in &["refs; echo", ""] {
+            let result = validate_refspec(spec);
+            assert!(result.is_err(), "should reject: {spec:?}");
+            let msg = format!("{:?}", result.unwrap_err());
+            assert!(
+                msg.contains("invalid refspec"),
+                "error should mention 'invalid refspec': {msg}"
+            );
+        }
     }
 }
