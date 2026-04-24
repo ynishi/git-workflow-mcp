@@ -22,6 +22,19 @@ MCP server providing session-guarded git worktree management for AI agent pipeli
 | `diff` | Show git diff (stat + patch) | No |
 | `log` | Show git log | No |
 
+## Modes
+
+The server exposes different tool subsets depending on `--mode`:
+
+| `--mode` | Exposed tools | Typical use |
+|---|---|---|
+| `full` (default) | All tools | Full worktree workflow (read + local write + remote) |
+| `read-only` | `status`, `diff`, `log`, `worktree_list`, `session_start` | Local read-only inspection |
+| `read-remote` | read-only tools + `fetch`, `remote_list` | Remote sync without local/remote write |
+
+`read-remote` is a superset of `read-only`; `full` is a superset of `read-remote`.
+No `push`, `clone`, or remote-configuration tools are exposed — those remain CLI-only.
+
 ## Workflow
 
 ```

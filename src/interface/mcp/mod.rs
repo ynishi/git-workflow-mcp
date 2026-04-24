@@ -29,11 +29,15 @@ const WRITE_TOOLS: &[&str] = &[
     "safe_reset",
 ];
 
+/// read-remote モードでのみ利用可能なツール名 (read-only では除外)
+const READ_REMOTE_ONLY_TOOLS: &[&str] = &["fetch", "remote_list"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ServerMode {
     #[default]
     Full,
     ReadOnly,
+    ReadRemote,
 }
 
 /// Heartbeat 発火間隔 (秒)。debugging 目的で短めに固定。
@@ -211,13 +215,17 @@ impl ServerHandler for GitWorkflowServer {
              \n\
              session_release: take ownership of an orphan worktree from a previous session";
 
-        let instructions = if self.mode == ServerMode::ReadOnly {
-            format!(
+        let instructions = match self.mode {
+            ServerMode::ReadOnly => format!(
                 "{base_instructions}\n\n\
                  NOTE: This server is running in read-only mode. Write operations are disabled."
-            )
-        } else {
-            base_instructions.to_string()
+            ),
+            ServerMode::ReadRemote => format!(
+                "{base_instructions}\n\n\
+                 NOTE: This server is running in read-remote mode. Write operations are disabled; \
+                 fetch and remote_list are available for remote sync (no push)."
+            ),
+            ServerMode::Full => base_instructions.to_string(),
         };
 
         ServerInfo {
@@ -245,8 +253,17 @@ impl ServerHandler for GitWorkflowServer {
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut tools = self.tool_router.list_all();
-        if self.mode == ServerMode::ReadOnly {
-            tools.retain(|t| !WRITE_TOOLS.contains(&t.name.as_ref()));
+        match self.mode {
+            ServerMode::ReadOnly => {
+                tools.retain(|t| {
+                    !WRITE_TOOLS.contains(&t.name.as_ref())
+                        && !READ_REMOTE_ONLY_TOOLS.contains(&t.name.as_ref())
+                });
+            }
+            ServerMode::ReadRemote => {
+                tools.retain(|t| !WRITE_TOOLS.contains(&t.name.as_ref()));
+            }
+            ServerMode::Full => {}
         }
         Ok(ListToolsResult {
             tools,
@@ -263,11 +280,29 @@ impl ServerHandler for GitWorkflowServer {
         use futures::FutureExt;
         use std::panic::AssertUnwindSafe;
 
-        if self.mode == ServerMode::ReadOnly && WRITE_TOOLS.contains(&request.name.as_ref()) {
-            return Err(McpError::invalid_params(
-                format!("tool '{}' is not available in read-only mode", request.name),
-                None,
-            ));
+        match self.mode {
+            ServerMode::ReadOnly => {
+                if WRITE_TOOLS.contains(&request.name.as_ref())
+                    || READ_REMOTE_ONLY_TOOLS.contains(&request.name.as_ref())
+                {
+                    return Err(McpError::invalid_params(
+                        format!("tool '{}' is not available in read-only mode", request.name),
+                        None,
+                    ));
+                }
+            }
+            ServerMode::ReadRemote => {
+                if WRITE_TOOLS.contains(&request.name.as_ref()) {
+                    return Err(McpError::invalid_params(
+                        format!(
+                            "tool '{}' is not available in read-remote mode",
+                            request.name
+                        ),
+                        None,
+                    ));
+                }
+            }
+            ServerMode::Full => {}
         }
         let tool_name = request.name.to_string();
         let tool_ctx = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);

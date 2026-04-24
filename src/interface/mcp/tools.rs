@@ -91,6 +91,24 @@ struct LogRequest {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+struct FetchRequest {
+    /// Working directory path (repo root or worktree)
+    working_dir: String,
+    /// Remote name (default: "origin")
+    remote: Option<String>,
+    /// Refspec (e.g. "refs/heads/main" or "+refs/heads/*:refs/remotes/origin/*")
+    refspec: Option<String>,
+    /// Prune deleted remote branches (default: false)
+    prune: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct RemoteListRequest {
+    /// Working directory path (repo root or worktree)
+    working_dir: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 struct SafeResetRequest {
     /// Working directory path (worktree or repo root)
     working_dir: String,
@@ -584,6 +602,75 @@ impl GitWorkflowServer {
                 "Reset completed ({}).\n- Previous HEAD: {}\n- New HEAD: {}\n- Target: {}\nTo undo: git reset --soft {}",
                 result.mode, result.previous_head, result.new_head, target, result.previous_head
             ),
+        )]))
+    }
+
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "fetch"),
+        err
+    )]
+    #[tool(
+        name = "fetch",
+        description = "Run `git fetch` against a remote. Working tree unchanged. \
+                       No write to local branches (refs/remotes/* only).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            // idempotent_hint = false: remote 状態依存で同 args でも新 commit が来れば結果変化する
+            idempotent_hint = false
+        )
+    )]
+    async fn fetch(
+        &self,
+        Parameters(req): Parameters<FetchRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let working_dir = std::path::Path::new(&req.working_dir);
+        let stdout = git::fetch(
+            working_dir,
+            req.remote.as_deref(),
+            req.refspec.as_deref(),
+            req.prune.unwrap_or(false),
+        )
+        .map_err(Self::to_mcp_error)?;
+
+        let output = if stdout.is_empty() {
+            "fetch completed (no output)".to_string()
+        } else {
+            stdout
+        };
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            output,
+        )]))
+    }
+
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "remote_list"),
+        err
+    )]
+    #[tool(
+        name = "remote_list",
+        description = "List configured remotes (equivalent to `git remote -v`).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn remote_list(
+        &self,
+        Parameters(req): Parameters<RemoteListRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let working_dir = std::path::Path::new(&req.working_dir);
+        let entries = git::remote_list(working_dir).map_err(Self::to_mcp_error)?;
+
+        let mut output = format!("{} remote(s):\n", entries.len());
+        for e in &entries {
+            output.push_str(&format!("  {} {} ({})\n", e.name, e.url, e.direction));
+        }
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            output,
         )]))
     }
 }

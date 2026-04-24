@@ -1269,6 +1269,128 @@ async fn test_session_release_allows_other_session() {
     client_b.cancel().await.unwrap();
 }
 
+// ─── read-remote / fetch / remote_list tests ─────────────
+
+#[tokio::test]
+async fn test_read_only_excludes_fetch_and_remote_list() {
+    let client = connect_with_args(&["--mode", "read-only"]).await;
+    let tools = client.peer().list_all_tools().await.unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert!(
+        !names.contains(&"fetch"),
+        "fetch should not be exposed in read-only mode"
+    );
+    assert!(
+        !names.contains(&"remote_list"),
+        "remote_list should not be exposed in read-only mode"
+    );
+    client.cancel().await.ok();
+}
+
+#[tokio::test]
+async fn test_read_remote_exposes_fetch_and_remote_list() {
+    let client = connect_with_args(&["--mode", "read-remote"]).await;
+    let tools = client.peer().list_all_tools().await.unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert!(
+        names.contains(&"fetch"),
+        "fetch should be exposed in read-remote mode"
+    );
+    assert!(
+        names.contains(&"remote_list"),
+        "remote_list should be exposed in read-remote mode"
+    );
+    // WRITE_TOOLS は除外
+    assert!(!names.contains(&"commit"));
+    assert!(!names.contains(&"merge"));
+    assert!(!names.contains(&"worktree_add"));
+    // read-only tools は含まれる
+    assert!(names.contains(&"status"));
+    client.cancel().await.ok();
+}
+
+#[tokio::test]
+async fn test_full_exposes_fetch_and_remote_list() {
+    let client = connect_with_args(&[]).await; // default = full
+    let tools = client.peer().list_all_tools().await.unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert!(names.contains(&"fetch"));
+    assert!(names.contains(&"remote_list"));
+    client.cancel().await.ok();
+}
+
+#[tokio::test]
+async fn test_fetch_with_local_bare_origin() {
+    let repo = TempRepo::new();
+    let origin_dir = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init", "--bare"])
+        .current_dir(origin_dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            origin_dir.path().to_str().unwrap(),
+        ])
+        .current_dir(repo.dir.path())
+        .output()
+        .unwrap();
+
+    let client = connect_with_args(&["--mode", "read-remote"]).await;
+
+    // remote_list が origin を含むことを確認
+    let remote_result = client
+        .peer()
+        .call_tool(call_params(
+            "remote_list",
+            json!({ "working_dir": repo.path_str() }),
+        ))
+        .await
+        .unwrap();
+    let remote_text = format!("{:?}", remote_result.content);
+    assert!(remote_text.contains("origin"));
+
+    // fetch 成功
+    let fetch_result = client
+        .peer()
+        .call_tool(call_params(
+            "fetch",
+            json!({
+                "working_dir": repo.path_str(),
+                "remote": "origin"
+            }),
+        ))
+        .await
+        .unwrap();
+    assert!(!fetch_result.is_error.unwrap_or(false));
+
+    client.cancel().await.ok();
+}
+
+#[tokio::test]
+async fn test_fetch_rejects_invalid_remote_name() {
+    let repo = TempRepo::new();
+    let client = connect_with_args(&["--mode", "read-remote"]).await;
+    let result = client
+        .peer()
+        .call_tool(call_params(
+            "fetch",
+            json!({
+                "working_dir": repo.path_str(),
+                "remote": "origin; rm -rf /"
+            }),
+        ))
+        .await;
+    if let Ok(r) = result {
+        assert!(r.is_error.unwrap_or(false));
+    }
+    // Err(_) is also acceptable
+    client.cancel().await.ok();
+}
+
 // ─── Helpers ──────────────────────────────────────────────
 
 fn add_commit_in_dir(dir: &std::path::Path, filename: &str, content: &str, message: &str) {

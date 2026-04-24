@@ -16,12 +16,20 @@ expression: tool_summary
     "name": "diff"
   },
   {
+    "description": "Run `git fetch` against a remote. Working tree unchanged. No write to local branches (refs/remotes/* only).",
+    "name": "fetch"
+  },
+  {
     "description": "Show git log (commit history) for a working directory. Does not require session_start.",
     "name": "log"
   },
   {
     "description": "Merge a branch into the target branch (must be current branch). Session-guarded. Requires session_start.",
     "name": "merge"
+  },
+  {
+    "description": "List configured remotes (equivalent to `git remote -v`).",
+    "name": "remote_list"
   },
   {
     "description": "Safely reset HEAD to a target commit. Only supports 'soft' (move HEAD, keep staged and working tree) and 'mixed' (move HEAD, unstage changes, keep working tree) modes. Hard reset is intentionally not supported. Returns the previous HEAD hash for recovery. Does not require session_start.",
