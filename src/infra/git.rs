@@ -391,8 +391,28 @@ pub fn log(
 
 // ─── Commit ──────────────────────────────────────────────
 
-pub fn commit(working_dir: &Path, message: &str) -> Result<CommitResult, DomainError> {
-    run_git(working_dir, &["add", "-A"])?;
+pub fn commit(
+    working_dir: &Path,
+    message: &str,
+    paths: Option<&[String]>,
+) -> Result<CommitResult, DomainError> {
+    match paths {
+        Some(ps) if !ps.is_empty() => {
+            for p in ps {
+                if p.starts_with('-') {
+                    return Err(DomainError::Git(format!(
+                        "invalid path (starts with '-'): {p}"
+                    )));
+                }
+            }
+            let mut args: Vec<&str> = vec!["add", "--"];
+            args.extend(ps.iter().map(String::as_str));
+            run_git(working_dir, &args)?;
+        }
+        _ => {
+            run_git(working_dir, &["add", "-A"])?;
+        }
+    }
 
     // 変更があるか確認
     let staged = run_git(working_dir, &["diff", "--cached", "--stat"])?;

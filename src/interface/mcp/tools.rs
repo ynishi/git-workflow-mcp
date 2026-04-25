@@ -46,6 +46,14 @@ struct CommitRequest {
     working_dir: String,
     /// Commit message
     message: String,
+    /// Optional list of paths to commit (relative to working_dir).
+    /// If specified, only these paths are staged via `git add -- <paths>` and
+    /// committed; any pre-staged changes outside this list remain staged but are
+    /// NOT included in this commit. If omitted or empty, falls back to `git add -A`
+    /// which stages and commits ALL changes (modified, new, and deleted files)
+    /// in the working tree, including anything previously staged.
+    #[serde(default)]
+    paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -367,7 +375,11 @@ impl GitWorkflowServer {
     )]
     #[tool(
         name = "commit",
-        description = "Stage all changes and create a commit in the specified working directory. Does not require session_start.",
+        description = "Create a commit in the specified working directory. Does not require session_start. \
+            By default (paths omitted), runs `git add -A` first, so ALL working-tree changes — including \
+            modifications outside what you intended and any previously staged files — are bundled into one \
+            commit. To commit only a specific subset, pass `paths` (relative to working_dir); only those \
+            paths are staged and committed, and other pre-staged or unstaged changes are left untouched.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -379,7 +391,8 @@ impl GitWorkflowServer {
         Parameters(req): Parameters<CommitRequest>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let working_dir = std::path::Path::new(&req.working_dir);
-        let result = git::commit(working_dir, &req.message).map_err(Self::to_mcp_error)?;
+        let result = git::commit(working_dir, &req.message, req.paths.as_deref())
+            .map_err(Self::to_mcp_error)?;
 
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             format!(
