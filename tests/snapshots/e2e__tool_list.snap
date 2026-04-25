@@ -1,5 +1,6 @@
 ---
 source: tests/e2e.rs
+assertion_line: 121
 expression: tool_summary
 ---
 [
@@ -8,7 +9,7 @@ expression: tool_summary
     "name": "branch_delete"
   },
   {
-    "description": "Stage all changes and create a commit in the specified working directory. Does not require session_start.",
+    "description": "Create a commit in the specified working directory. Does not require session_start. By default (paths omitted), runs `git add -A` first, so ALL working-tree changes — including modifications outside what you intended and any previously staged files — are bundled into one commit. To commit only a specific subset, pass `paths` (relative to working_dir); only those paths are staged and committed, and other pre-staged or unstaged changes are left untouched.",
     "name": "commit"
   },
   {
