@@ -104,3 +104,46 @@ pub struct IsPushedResult {
     /// commit を含む remote ref 名の一覧 (例: "refs/remotes/origin/main")
     pub refs: Vec<String>,
 }
+
+/// tag が remote に push 済みかどうか。
+///
+/// `git ls-remote --tags <remote> refs/tags/<tag>` で remote refs を直接照会した結果。
+/// local tag metadata には依存しない。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TagPushStatus {
+    /// remote に tag が存在する場合 true
+    pub pushed: bool,
+    /// remote から返された refs/tags/... の一覧 (e.g. "refs/tags/v1.0.0")
+    pub remote_refs: Vec<String>,
+}
+
+/// first-parent walk で N 歩遡った commit のターゲット情報。
+///
+/// `git log --first-parent --format=%H%x09%P%x09%s -n <N+1> <from>` で取得。
+/// `HEAD~N` arithmetic は使用しない。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ResetTargetResult {
+    /// ターゲット commit の hash
+    pub target_hash: String,
+    /// ターゲット commit の subject
+    pub target_subject: String,
+    /// false if any merge commit was on the first-parent traversal path
+    pub linear: bool,
+}
+
+/// worktree の状態スナップショット。
+///
+/// `branch_status` (ahead/behind) + upstream tracking ref + uncommitted file 数を 1 回で返す。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WorktreeState {
+    /// uncommitted == 0 のとき true
+    pub clean: bool,
+    /// upstream より branch が ahead な commit 数
+    pub ahead: u32,
+    /// branch より upstream が ahead な commit 数
+    pub behind: u32,
+    /// upstream tracking ref (e.g. "origin/main")。未設定なら None
+    pub tracking: Option<String>,
+    /// uncommitted ファイル数 (`git status --porcelain` の行数)
+    pub uncommitted: u32,
+}

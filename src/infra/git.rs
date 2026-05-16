@@ -4,7 +4,8 @@ use std::process::Command;
 use crate::domain::error::DomainError;
 use crate::domain::worktree::{
     BranchStatus, CommitResult, DiffResult, IsPushedResult, LogEntry, MergeResult, RemoteEntry,
-    RepoStatus, ResetResult, UnpushedCommits, Worktree,
+    RepoStatus, ResetResult, ResetTargetResult, TagPushStatus, UnpushedCommits, Worktree,
+    WorktreeState,
 };
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String, DomainError> {
@@ -763,6 +764,168 @@ pub fn is_pushed(
     Ok(IsPushedResult { pushed, refs })
 }
 
+// ─── Publish / rollback query tools ─────────────────────
+
+/// Checks whether `tag` is pushed to `remote` by querying the remote's refs directly.
+///
+/// Uses `git ls-remote --tags <remote> refs/tags/<tag>`. Never inspects local
+/// tag metadata (`git tag -l` / `git for-each-ref refs/tags/`).
+///
+/// Network access to the remote is required (uses live `ls-remote` query).
+pub fn tag_pushed(
+    working_dir: &Path,
+    tag: &str,
+    remote: &str,
+) -> Result<TagPushStatus, DomainError> {
+    let refspec = format!("refs/tags/{tag}");
+    let raw = run_git(working_dir, &["ls-remote", "--tags", remote, &refspec])?;
+
+    // Each non-empty line is "<sha>\t<ref>". Collect the ref part.
+    let remote_refs: Vec<String> = raw
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|line| line.split('\t').nth(1).map(|r| r.to_string()))
+        .collect();
+
+    let pushed = !remote_refs.is_empty();
+    Ok(TagPushStatus {
+        pushed,
+        remote_refs,
+    })
+}
+
+/// Computes the target commit hash `steps_back` commits before `from` using a
+/// strict first-parent walk. Returns `linear = false` if any commit on the
+/// traversal path has 2+ parents (i.e. a merge commit was encountered).
+///
+/// Never uses `HEAD~N` rev-parse arithmetic. Uses
+/// `git log --first-parent --format=%H%x09%P%x09%s -n <steps_back+1> <from>`.
+///
+/// Does NOT perform an actual reset; only computes the target hash. To execute
+/// the reset, use `safe_reset` with the returned hash.
+pub fn reset_target(
+    working_dir: &Path,
+    steps_back: u32,
+    from: &str,
+) -> Result<ResetTargetResult, DomainError> {
+    let n_plus_one = steps_back + 1;
+    let n_str = n_plus_one.to_string();
+
+    // %H = full hash, %P = parent hashes (space-separated), %s = subject
+    let raw = run_git(
+        working_dir,
+        &[
+            "log",
+            "--first-parent",
+            "--format=%H%x09%P%x09%s",
+            "-n",
+            &n_str,
+            from,
+        ],
+    )?;
+
+    let lines: Vec<&str> = raw.lines().filter(|l| !l.is_empty()).collect();
+
+    if lines.len() < n_plus_one as usize {
+        let actual = lines.len().saturating_sub(1); // index 0 is `from` itself
+        return Err(DomainError::Git(format!(
+            "history too shallow: requested {steps_back} steps, only {actual} commits reachable"
+        )));
+    }
+
+    // linear = true iff no commit in the path has 2+ parents
+    let linear = lines.iter().all(|line| {
+        // second tab-field is the parent list
+        let parents_field = line.split('\t').nth(1).unwrap_or("");
+        // empty = root commit (0 parents), single word = 1 parent, 2+ words = merge
+        parents_field.split_whitespace().count() <= 1
+    });
+
+    // The target is at index steps_back (0 = from itself, N = N steps back)
+    let target_line = lines[steps_back as usize];
+    let mut parts = target_line.splitn(3, '\t');
+    let target_hash = parts.next().unwrap_or("").to_string();
+    let _parents = parts.next().unwrap_or("");
+    let target_subject = parts.next().unwrap_or("").to_string();
+
+    Ok(ResetTargetResult {
+        target_hash,
+        target_subject,
+        linear,
+    })
+}
+
+/// Returns a typed snapshot of a worktree's state.
+///
+/// Combines:
+/// - `branch_status` (ahead / behind against upstream)
+/// - upstream tracking ref from `git rev-parse --abbrev-ref @{upstream}`
+/// - uncommitted file count from `git status --porcelain`
+///
+/// The upstream `@{upstream}` command is executed directly (not via `run_git`)
+/// so that exit 128 (no upstream configured) is mapped to `tracking: None`
+/// instead of `DomainError::Git`.
+///
+/// Assumes remote refs are up-to-date (call `fetch` first if needed).
+pub fn worktree_state(
+    working_dir: &Path,
+    branch: Option<&str>,
+) -> Result<WorktreeState, DomainError> {
+    // Step 1: resolve branch name
+    let resolved_branch = match branch {
+        Some(b) => b.to_string(),
+        None => run_git(working_dir, &["branch", "--show-current"])?,
+    };
+
+    // Step 2: upstream tracking ref — exit 128 means "no upstream", map to None
+    let tracking: Option<String> = {
+        let output = Command::new("git")
+            .args(["-C", &working_dir.to_string_lossy()])
+            .args(["rev-parse", "--abbrev-ref", "@{upstream}"])
+            .output()?;
+        if output.status.success() {
+            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if raw.is_empty() { None } else { Some(raw) }
+        } else {
+            // exit 128 = no upstream configured; other non-zero = propagate
+            match output.status.code() {
+                Some(128) => None,
+                _ => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    return Err(DomainError::Git(stderr));
+                }
+            }
+        }
+    };
+
+    // Step 3: ahead / behind via branch_status (reuses Subtask 1 impl)
+    let (ahead, behind) = if let Some(ref upstream) = tracking {
+        let status = branch_status(working_dir, &resolved_branch, upstream)?;
+        (status.ahead, status.behind)
+    } else {
+        (0, 0)
+    };
+
+    // Step 4: uncommitted file count via `git status --porcelain`
+    let porcelain = run_git(working_dir, &["status", "--porcelain"])?;
+    let uncommitted: u32 = porcelain
+        .lines()
+        .filter(|l| !l.is_empty())
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX);
+
+    let clean = uncommitted == 0;
+
+    Ok(WorktreeState {
+        clean,
+        ahead,
+        behind,
+        tracking,
+        uncommitted,
+    })
+}
+
 // ─── Unit tests ──────────────────────────────────────────
 
 #[cfg(test)]
@@ -1442,5 +1605,261 @@ mod tests {
             result.refs.is_empty(),
             "refs must be empty for local-only commit"
         );
+    }
+
+    // ── tag_pushed ────────────────────────────────────────
+
+    /// Helper: bare repo + local repo with initial commit + origin remote.
+    fn init_repo_with_remote() -> (TempDir, TempDir) {
+        let bare = tempfile::tempdir().expect("bare tempdir");
+        let bare_path = bare.path();
+        StdCommand::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .current_dir(bare_path)
+            .output()
+            .expect("git init bare");
+
+        let local = tempfile::tempdir().expect("local tempdir");
+        let local_path = local.path();
+        StdCommand::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(local_path)
+            .output()
+            .expect("git init local");
+        StdCommand::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(local_path)
+            .output()
+            .expect("config email");
+        StdCommand::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(local_path)
+            .output()
+            .expect("config name");
+        add_commit(local_path, "init.txt", "init", "initial");
+        StdCommand::new("git")
+            .args(["remote", "add", "origin", &bare_path.to_string_lossy()])
+            .current_dir(local_path)
+            .output()
+            .expect("remote add");
+        StdCommand::new("git")
+            .args(["push", "-u", "origin", "main"])
+            .current_dir(local_path)
+            .output()
+            .expect("git push main");
+        (bare, local)
+    }
+
+    /// tag が remote に push 済みなら pushed=true、remote_refs に refs/tags/<tag> を返す。
+    #[test]
+    fn test_tag_pushed_true_when_tag_is_on_remote() {
+        let (bare, local) = init_repo_with_remote();
+        let bare_path = bare.path();
+        let local_path = local.path();
+
+        // local に tag を作って remote に push
+        StdCommand::new("git")
+            .args(["tag", "v1.0.0"])
+            .current_dir(local_path)
+            .output()
+            .expect("git tag");
+        StdCommand::new("git")
+            .args(["push", "origin", "refs/tags/v1.0.0"])
+            .current_dir(local_path)
+            .output()
+            .expect("git push tag");
+
+        // ls-remote は file:// remote でも動作する
+        // ただし run_git はリモート名 "origin" を展開するため working_dir が必要
+        let result =
+            tag_pushed(local_path, "v1.0.0", &bare_path.to_string_lossy()).expect("tag_pushed");
+        assert!(result.pushed, "pushed tag should return pushed=true");
+        assert!(
+            !result.remote_refs.is_empty(),
+            "remote_refs must contain the tag ref"
+        );
+        assert!(
+            result.remote_refs.iter().any(|r| r == "refs/tags/v1.0.0"),
+            "remote_refs should contain refs/tags/v1.0.0, got: {:?}",
+            result.remote_refs
+        );
+    }
+
+    /// 存在しない tag は pushed=false、remote_refs は空。
+    #[test]
+    fn test_tag_pushed_false_when_tag_not_on_remote() {
+        let (bare, local) = init_repo_with_remote();
+        let bare_path = bare.path();
+        let local_path = local.path();
+
+        // tag は local にも remote にも作らない
+        let result = tag_pushed(local_path, "v9.9.9", &bare_path.to_string_lossy())
+            .expect("tag_pushed absent");
+        assert!(!result.pushed, "absent tag should return pushed=false");
+        assert!(
+            result.remote_refs.is_empty(),
+            "remote_refs must be empty for absent tag"
+        );
+    }
+
+    /// local にのみある tag (remote に push していない) は pushed=false。
+    #[test]
+    fn test_tag_pushed_false_when_tag_local_only() {
+        let (bare, local) = init_repo_with_remote();
+        let bare_path = bare.path();
+        let local_path = local.path();
+
+        // tag を local にのみ作成、remote に push しない
+        StdCommand::new("git")
+            .args(["tag", "v2.0.0"])
+            .current_dir(local_path)
+            .output()
+            .expect("git tag local only");
+
+        let result = tag_pushed(local_path, "v2.0.0", &bare_path.to_string_lossy())
+            .expect("tag_pushed local-only");
+        assert!(!result.pushed, "local-only tag should return pushed=false");
+        assert!(
+            result.remote_refs.is_empty(),
+            "remote_refs must be empty for local-only tag"
+        );
+    }
+
+    // ── reset_target ──────────────────────────────────────
+
+    /// linear history で N=1 → first-parent 1 歩戻りが正しい hash を返す。
+    #[test]
+    fn test_reset_target_linear_history_n1() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // commit A の hash (initial)
+        let hash_a = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_path)
+            .output()
+            .expect("rev-parse A");
+        let hash_a = String::from_utf8_lossy(&hash_a.stdout).trim().to_string();
+
+        // commit B を追加
+        add_commit(repo_path, "b.txt", "b", "commit B");
+
+        let result = reset_target(repo_path, 1, "HEAD").expect("reset_target n=1");
+        assert_eq!(
+            result.target_hash, hash_a,
+            "target_hash should be initial commit"
+        );
+        assert!(result.linear, "linear history: linear must be true");
+        assert!(
+            !result.target_subject.is_empty(),
+            "target_subject must not be empty"
+        );
+    }
+
+    /// N が history 件数を超えると DomainError::Git("history too shallow") を返す。
+    #[test]
+    fn test_reset_target_history_too_shallow() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // initial commit 1 件しかない。N=2 は超過。
+        let result = reset_target(repo_path, 2, "HEAD");
+        assert!(result.is_err(), "should fail when N exceeds history depth");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("history too shallow"),
+            "error should mention 'history too shallow': {msg}"
+        );
+    }
+
+    /// merge commit を含む history で linear=false を返す。
+    #[test]
+    fn test_reset_target_merge_commit_yields_linear_false() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // topic branch を分岐して commit
+        StdCommand::new("git")
+            .args(["checkout", "-b", "topic-rt"])
+            .current_dir(repo_path)
+            .output()
+            .expect("checkout -b topic-rt");
+        add_commit(repo_path, "topic-rt.txt", "t", "topic-rt commit");
+
+        // main に戻って別 commit を追加してから merge (merge commit 生成)
+        StdCommand::new("git")
+            .args(["checkout", "main"])
+            .current_dir(repo_path)
+            .output()
+            .expect("checkout main");
+        add_commit(repo_path, "main-extra.txt", "m", "main extra");
+        StdCommand::new("git")
+            .args(["merge", "--no-ff", "topic-rt", "-m", "merge topic-rt"])
+            .current_dir(repo_path)
+            .output()
+            .expect("merge --no-ff");
+
+        // HEAD は merge commit。N=1 で first-parent は main-extra commit。
+        // N=2 で first-parent は initial commit。
+        // いずれの走査にも merge commit 自体 (HEAD) が含まれ linear=false。
+        let result = reset_target(repo_path, 1, "HEAD").expect("reset_target merge");
+        assert!(!result.linear, "merge commit in path: linear must be false");
+    }
+
+    // ── worktree_state ────────────────────────────────────
+
+    /// upstream 未設定の場合、tracking=None で clean=true が返る。
+    #[test]
+    fn test_worktree_state_no_upstream() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        let result = worktree_state(repo_path, None).expect("worktree_state no upstream");
+        assert_eq!(result.tracking, None, "no upstream: tracking must be None");
+        assert_eq!(result.ahead, 0, "no upstream: ahead must be 0");
+        assert_eq!(result.behind, 0, "no upstream: behind must be 0");
+        assert!(result.clean, "fresh repo: clean must be true");
+        assert_eq!(result.uncommitted, 0);
+    }
+
+    /// uncommitted ファイルがある場合、clean=false かつ uncommitted > 0 を返す。
+    #[test]
+    fn test_worktree_state_dirty() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // uncommitted (modified) ファイルを作成
+        std::fs::write(repo_path.join("dirty.txt"), "dirty").unwrap();
+
+        let result = worktree_state(repo_path, None).expect("worktree_state dirty");
+        assert!(!result.clean, "dirty repo: clean must be false");
+        assert!(result.uncommitted > 0, "uncommitted must be > 0");
+    }
+
+    /// upstream 設定あり、ahead/behind が正しく返る。
+    #[test]
+    fn test_worktree_state_with_upstream() {
+        let (_bare, local) = init_repo_with_remote();
+        let local_path = local.path();
+
+        // upstream を origin/main に設定
+        StdCommand::new("git")
+            .args(["branch", "--set-upstream-to=origin/main", "main"])
+            .current_dir(local_path)
+            .output()
+            .expect("set upstream");
+
+        // local に commit を追加 → ahead=1
+        add_commit(local_path, "extra.txt", "e", "extra commit");
+
+        let result = worktree_state(local_path, None).expect("worktree_state with upstream");
+        assert_eq!(
+            result.tracking,
+            Some("origin/main".to_string()),
+            "tracking must be origin/main"
+        );
+        assert_eq!(result.ahead, 1, "ahead must be 1 after local commit");
+        assert_eq!(result.behind, 0, "behind must be 0");
+        assert!(result.clean, "no uncommitted changes: clean must be true");
     }
 }
