@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-16
+
 ### Added
 
 - `branch_status` tool: compare a branch against a base ref and return `ahead`, `behind`, and `up_to_date` as discrete typed integer/boolean fields. Uses `git rev-list --left-right --count base...branch` to avoid direction-misread errors. Returns `ahead_commits` and `behind_commits` as typed `LogEntry` lists. Assumes remote refs are up-to-date (`fetch` first if needed).
