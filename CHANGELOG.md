@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-16
+
+### Security
+
+- `is_pushed` and `tag_pushed`: apply `validate_remote_name` at function entry before any `run_git` call. Inputs matching attack patterns (dash-prefixed options such as `--upload-pack=`, `--config=`, empty string, or `-`-prefixed values) now return `DomainError::Git("invalid remote name: ...")` immediately without spawning a git subprocess. Closes the git option-injection vector (CVE-2017-1000117 family) for both functions, consistent with the existing guard already applied to `fetch`.
+
 ## [0.2.0] - 2026-05-16
 
 ### Added
