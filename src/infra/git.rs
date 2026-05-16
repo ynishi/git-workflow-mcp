@@ -522,6 +522,7 @@ pub fn merge(
 // Called by fetch(); also used directly from interface layer in Subtask 2.
 pub fn validate_remote_name(s: &str) -> Result<(), DomainError> {
     if s.is_empty()
+        || s.starts_with('-')
         || !s
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
@@ -742,6 +743,7 @@ pub fn is_pushed(
     commit: &str,
     remote: &str,
 ) -> Result<IsPushedResult, DomainError> {
+    validate_remote_name(remote)?;
     let refspace = format!("refs/remotes/{remote}/");
     let raw = run_git(
         working_dir,
@@ -777,6 +779,7 @@ pub fn tag_pushed(
     tag: &str,
     remote: &str,
 ) -> Result<TagPushStatus, DomainError> {
+    validate_remote_name(remote)?;
     let refspec = format!("refs/tags/{tag}");
     let raw = run_git(working_dir, &["ls-remote", "--tags", remote, &refspec])?;
 
@@ -1723,6 +1726,42 @@ mod tests {
             result.remote_refs.is_empty(),
             "remote_refs must be empty for local-only tag"
         );
+    }
+
+    // ── is_pushed rejection ───────────────────────────────
+
+    /// is_pushed は malicious remote 名を run_git より前に拒否する。
+    #[test]
+    fn test_is_pushed_rejects_invalid_remote_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let working_dir = dir.path();
+        for name in &["--upload-pack=foo", "--config=core.foo=bar", "", "-x"] {
+            let result = is_pushed(working_dir, "deadbeef", name);
+            assert!(result.is_err(), "should reject: {name:?}");
+            let msg = format!("{:?}", result.unwrap_err());
+            assert!(
+                msg.contains("invalid remote name"),
+                "error should mention 'invalid remote name': {msg}"
+            );
+        }
+    }
+
+    // ── tag_pushed rejection ──────────────────────────────
+
+    /// tag_pushed は malicious remote 名を run_git より前に拒否する。
+    #[test]
+    fn test_tag_pushed_rejects_invalid_remote_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let working_dir = dir.path();
+        for name in &["--upload-pack=foo", "--config=core.foo=bar", "", "-x"] {
+            let result = tag_pushed(working_dir, "v0.0.0", name);
+            assert!(result.is_err(), "should reject: {name:?}");
+            let msg = format!("{:?}", result.unwrap_err());
+            assert!(
+                msg.contains("invalid remote name"),
+                "error should mention 'invalid remote name': {msg}"
+            );
+        }
     }
 
     // ── reset_target ──────────────────────────────────────
