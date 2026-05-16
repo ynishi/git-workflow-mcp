@@ -21,6 +21,12 @@ MCP server providing session-guarded git worktree management for AI agent pipeli
 | `status` | Show git status | No |
 | `diff` | Show git diff (stat + patch) | No |
 | `log` | Show git log | No |
+| `branch_status` | Return ahead/behind counts and commit lists as typed fields (no string parsing required) | No |
+| `unpushed_commits` | List commits on a local branch not yet on its remote tracking ref | No |
+| `is_pushed` | Check whether a commit is reachable from any remote tracking ref | No |
+| `tag_pushed` | Check whether a tag exists on a remote by querying remote refs directly | No |
+| `reset_target` | Compute the target commit hash N steps back via first-parent walk (no actual reset) | No |
+| `worktree_state` | Return a typed snapshot of clean/ahead/behind/tracking/uncommitted in one call | No |
 
 ## Modes
 
@@ -55,6 +61,52 @@ worktree_remove / merge / branch_delete    # now succeeds
 ```
 
 `session_release` is idempotent — calling it for an already-released or non-existent name always succeeds.
+
+## Structured Branch and Tag Inspection
+
+Six read-only tools eliminate common AI git-parsing errors at BUMP/Publish moments.
+
+### ahead/behind without direction errors
+
+`branch_status` returns `ahead`, `behind`, and `up_to_date` as discrete typed integer fields using `git rev-list --left-right --count base...branch`. There is no formatted string for the caller to parse, so direction-misread errors ("1 ahead" vs "1 behind") are structurally impossible.
+
+```
+branch_status(working_dir, branch: "main", base: "origin/main")
+→ { ahead: 1, behind: 0, up_to_date: false, ahead_commits: [...], behind_commits: [], common_ancestor: "abc123" }
+```
+
+`unpushed_commits` lists the commits absent from the remote tracking ref as a typed list. `is_pushed` checks whether a specific commit hash is reachable from any remote ref.
+
+All three tools assume remote refs are already fetched. Call `fetch` first when the remote state may have changed.
+
+### Tag remote visibility
+
+`tag_pushed` queries the remote's tag refs directly via `git ls-remote --tags` and never inspects local tag metadata. This closes the gap where a tag created locally but not yet pushed appears "present" in local state.
+
+```
+tag_pushed(working_dir, tag: "v1.2.0", remote: "origin")
+→ { pushed: true, remote_refs: ["refs/tags/v1.2.0"] }
+```
+
+### Rollback target without merge-commit boundary crossing
+
+`reset_target` computes the target commit hash by walking the first-parent chain for N steps (`git log --first-parent`), never using `HEAD~N` arithmetic. `HEAD~N` silently crosses merge commits and lands on a second-parent commit, making the rollback target unreliable.
+
+```
+reset_target(working_dir, steps_back: 2, from: "HEAD")
+→ { target_hash: "def456", target_subject: "feat: ...", linear: true }
+```
+
+`reset_target` only computes the hash — it does not execute an actual reset.
+
+### Worktree state in one call
+
+`worktree_state` combines `branch_status`, upstream tracking ref resolution, and uncommitted file count into a single typed response, giving a complete picture without multiple round-trips.
+
+```
+worktree_state(working_dir)
+→ { clean: false, ahead: 1, behind: 0, tracking: "origin/main", uncommitted: 2 }
+```
 
 ## Installation
 
