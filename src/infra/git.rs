@@ -3,7 +3,8 @@ use std::process::Command;
 
 use crate::domain::error::DomainError;
 use crate::domain::worktree::{
-    CommitResult, DiffResult, LogEntry, MergeResult, RemoteEntry, RepoStatus, ResetResult, Worktree,
+    BranchStatus, CommitResult, DiffResult, IsPushedResult, LogEntry, MergeResult, RemoteEntry,
+    RepoStatus, ResetResult, UnpushedCommits, Worktree,
 };
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String, DomainError> {
@@ -617,6 +618,151 @@ pub fn remote_list(repo: &Path) -> Result<Vec<RemoteEntry>, DomainError> {
     Ok(entries)
 }
 
+// ─── Branch / Push status ────────────────────────────────
+
+/// Returns the ahead/behind counts and commit lists between `branch` and `base`.
+///
+/// Uses `git rev-list --left-right --count <base>...<branch>` (3-dots symmetric diff),
+/// which yields `<behind>\t<ahead>` in a single call.
+///
+/// # Argument order
+///
+/// `(working_dir, branch, base)`: **base is the reference point** (e.g. `origin/main`).
+/// Output interpretation: `split[0] = behind`, `split[1] = ahead`.
+/// Callers must never reinterpret the direction.
+pub fn branch_status(
+    working_dir: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<BranchStatus, DomainError> {
+    // Step 1: ahead / behind counts via --left-right --count (3-dots)
+    let raw = run_git(
+        working_dir,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{base}...{branch}"),
+        ],
+    )?;
+    let (behind, ahead) = raw
+        .split_once('\t')
+        .ok_or_else(|| DomainError::Git(format!("unexpected rev-list output: {raw}")))?;
+    let behind: u32 = behind
+        .trim()
+        .parse()
+        .map_err(|_| DomainError::Git(format!("unexpected rev-list output: {raw}")))?;
+    let ahead: u32 = ahead
+        .trim()
+        .parse()
+        .map_err(|_| DomainError::Git(format!("unexpected rev-list output: {raw}")))?;
+
+    // Step 2: common ancestor
+    let common_ancestor = run_git(working_dir, &["merge-base", base, branch])?;
+
+    // Step 3: ahead commits (in branch, not in base)
+    let ahead_raw = run_git(
+        working_dir,
+        &["log", "--format=%H%x09%s", &format!("{base}..{branch}")],
+    )?;
+    let ahead_commits = parse_log_entries(&ahead_raw);
+
+    // Step 4: behind commits (in base, not in branch)
+    let behind_raw = run_git(
+        working_dir,
+        &["log", "--format=%H%x09%s", &format!("{branch}..{base}")],
+    )?;
+    let behind_commits = parse_log_entries(&behind_raw);
+
+    Ok(BranchStatus {
+        ahead,
+        behind,
+        up_to_date: ahead == 0 && behind == 0,
+        ahead_commits,
+        behind_commits,
+        common_ancestor,
+    })
+}
+
+/// Parses `git log --format=%H%x09%s` output into `LogEntry` vec.
+fn parse_log_entries(raw: &str) -> Vec<LogEntry> {
+    raw.lines()
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let (hash, message) = line.split_once('\t').unwrap_or((line, ""));
+            LogEntry {
+                hash: hash.to_string(),
+                message: message.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Lists commits on `branch` that are not yet on `<remote>/<branch>`.
+///
+/// Uses `git rev-parse <remote>/<branch>` to get remote HEAD, then
+/// `git log --format=%H%x09%s <remote>/<branch>..<branch>` for the diff.
+/// Assumes remote refs are up-to-date (call `fetch` first if needed).
+pub fn unpushed_commits(
+    working_dir: &Path,
+    branch: &str,
+    remote: &str,
+) -> Result<UnpushedCommits, DomainError> {
+    let remote_ref = format!("{remote}/{branch}");
+
+    // Get remote HEAD hash
+    let remote_head = run_git(working_dir, &["rev-parse", &remote_ref])?;
+
+    // List commits on branch not yet on remote
+    let raw = run_git(
+        working_dir,
+        &[
+            "log",
+            "--format=%H%x09%s",
+            &format!("{remote_ref}..{branch}"),
+        ],
+    )?;
+    let commits = parse_log_entries(&raw);
+    let count = commits.len() as u32;
+
+    Ok(UnpushedCommits {
+        commits,
+        count,
+        remote_head,
+    })
+}
+
+/// Checks whether `commit` is reachable from any ref under `refs/remotes/<remote>/`.
+///
+/// Uses `git for-each-ref --contains <commit> refs/remotes/<remote>/`.
+/// Assumes remote refs are up-to-date (call `fetch` first if needed).
+pub fn is_pushed(
+    working_dir: &Path,
+    commit: &str,
+    remote: &str,
+) -> Result<IsPushedResult, DomainError> {
+    let refspace = format!("refs/remotes/{remote}/");
+    let raw = run_git(
+        working_dir,
+        &[
+            "for-each-ref",
+            "--contains",
+            commit,
+            "--format=%(refname)",
+            &refspace,
+        ],
+    )?;
+
+    let refs: Vec<String> = raw
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    let pushed = !refs.is_empty();
+
+    Ok(IsPushedResult { pushed, refs })
+}
+
 // ─── Unit tests ──────────────────────────────────────────
 
 #[cfg(test)]
@@ -1107,5 +1253,194 @@ mod tests {
                 "error should mention 'invalid refspec': {msg}"
             );
         }
+    }
+
+    // ── branch_status ─────────────────────────────────────
+
+    /// base と branch が同一のとき ahead=0, behind=0, up_to_date=true を返す。
+    #[test]
+    fn test_branch_status_same_branch_is_up_to_date() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // HEAD を指す branch_status(branch="main", base="main") → 0/0
+        let result = branch_status(repo_path, "main", "main").expect("branch_status");
+        assert_eq!(result.ahead, 0, "same ref: ahead must be 0");
+        assert_eq!(result.behind, 0, "same ref: behind must be 0");
+        assert!(result.up_to_date, "same ref: up_to_date must be true");
+        assert!(result.ahead_commits.is_empty());
+        assert!(result.behind_commits.is_empty());
+    }
+
+    /// branch が base より ahead なとき ahead > 0, behind = 0 を返す。
+    #[test]
+    fn test_branch_status_branch_ahead_of_base() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // base branch を作成 (initial commit と同じ位置)
+        StdCommand::new("git")
+            .args(["branch", "base-ref"])
+            .current_dir(repo_path)
+            .output()
+            .expect("git branch base-ref");
+
+        // main に commit を追加 → main は base-ref より ahead
+        add_commit(repo_path, "extra.txt", "extra", "extra commit");
+
+        let result = branch_status(repo_path, "main", "base-ref").expect("branch_status ahead");
+        assert_eq!(result.ahead, 1, "main should be 1 commit ahead of base-ref");
+        assert_eq!(result.behind, 0, "main should be 0 commits behind base-ref");
+        assert!(!result.up_to_date);
+        assert_eq!(result.ahead_commits.len(), 1);
+        assert!(result.behind_commits.is_empty());
+    }
+
+    /// base が branch より ahead (branch は behind) なとき behind > 0, ahead = 0 を返す。
+    #[test]
+    fn test_branch_status_branch_behind_base() {
+        let repo = init_repo();
+        let repo_path = repo.path();
+
+        // topic branch を initial commit と同じ位置に作成
+        StdCommand::new("git")
+            .args(["branch", "topic"])
+            .current_dir(repo_path)
+            .output()
+            .expect("git branch topic");
+
+        // main に commit を追加 → topic は main より behind
+        add_commit(repo_path, "main-extra.txt", "x", "main extra");
+
+        let result = branch_status(repo_path, "topic", "main").expect("branch_status behind");
+        assert_eq!(result.behind, 1, "topic should be 1 commit behind main");
+        assert_eq!(result.ahead, 0, "topic should be 0 commits ahead of main");
+        assert!(!result.up_to_date);
+        assert!(result.ahead_commits.is_empty());
+        assert_eq!(result.behind_commits.len(), 1);
+    }
+
+    // ── is_pushed ─────────────────────────────────────────
+
+    /// local clone で main の HEAD は origin/main から reachable → pushed=true。
+    #[test]
+    fn test_is_pushed_true_for_remote_commit() {
+        // bare repo を "remote" として使い、clone したローカル repo で検証する
+        let bare = tempfile::tempdir().expect("tempdir bare");
+        let bare_path = bare.path();
+
+        // bare remote を初期化して initial commit
+        StdCommand::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .current_dir(bare_path)
+            .output()
+            .expect("git init bare");
+
+        // non-bare local repo を作って bare へ push
+        let local = tempfile::tempdir().expect("tempdir local");
+        let local_path = local.path();
+        StdCommand::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(local_path)
+            .output()
+            .expect("git init local");
+        StdCommand::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(local_path)
+            .output()
+            .expect("git config email");
+        StdCommand::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(local_path)
+            .output()
+            .expect("git config name");
+        add_commit(local_path, "init.txt", "init", "initial");
+
+        StdCommand::new("git")
+            .args(["remote", "add", "origin", &bare_path.to_string_lossy()])
+            .current_dir(local_path)
+            .output()
+            .expect("git remote add");
+        StdCommand::new("git")
+            .args(["push", "-u", "origin", "main"])
+            .current_dir(local_path)
+            .output()
+            .expect("git push");
+
+        // HEAD の hash を取得
+        let head = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(local_path)
+            .output()
+            .expect("rev-parse HEAD");
+        let head_hash = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+        let result = is_pushed(local_path, &head_hash, "origin").expect("is_pushed");
+        assert!(result.pushed, "HEAD pushed to origin: pushed must be true");
+        assert!(!result.refs.is_empty(), "refs must contain origin/main ref");
+    }
+
+    /// topic branch のみにある commit は origin から reachable でない → pushed=false。
+    #[test]
+    fn test_is_pushed_false_for_local_only_commit() {
+        let bare = tempfile::tempdir().expect("tempdir bare");
+        let bare_path = bare.path();
+        StdCommand::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .current_dir(bare_path)
+            .output()
+            .expect("git init bare");
+
+        let local = tempfile::tempdir().expect("tempdir local");
+        let local_path = local.path();
+        StdCommand::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(local_path)
+            .output()
+            .expect("git init local");
+        StdCommand::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(local_path)
+            .output()
+            .expect("git config email");
+        StdCommand::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(local_path)
+            .output()
+            .expect("git config name");
+        add_commit(local_path, "init.txt", "init", "initial");
+
+        StdCommand::new("git")
+            .args(["remote", "add", "origin", &bare_path.to_string_lossy()])
+            .current_dir(local_path)
+            .output()
+            .expect("git remote add");
+        StdCommand::new("git")
+            .args(["push", "-u", "origin", "main"])
+            .current_dir(local_path)
+            .output()
+            .expect("git push");
+
+        // topic branch を作って local-only commit を追加
+        StdCommand::new("git")
+            .args(["checkout", "-b", "topic"])
+            .current_dir(local_path)
+            .output()
+            .expect("git checkout -b topic");
+        add_commit(local_path, "local-only.txt", "local", "local only commit");
+
+        let head = StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(local_path)
+            .output()
+            .expect("rev-parse HEAD");
+        let head_hash = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+        let result = is_pushed(local_path, &head_hash, "origin").expect("is_pushed");
+        assert!(!result.pushed, "local-only commit: pushed must be false");
+        assert!(
+            result.refs.is_empty(),
+            "refs must be empty for local-only commit"
+        );
     }
 }
