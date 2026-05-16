@@ -9,6 +9,10 @@ expression: tool_summary
     "name": "branch_delete"
   },
   {
+    "description": "Compare a branch against a base (typically its upstream remote tracking branch) and return ahead/behind commit counts as discrete typed fields, never as a formatted string. Use this to decide whether push/pull is needed without parsing git output. Assumes remote refs are up-to-date (call `fetch` first if needed).",
+    "name": "branch_status"
+  },
+  {
     "description": "Create a commit in the specified working directory. Does not require session_start. By default (paths omitted), runs `git add -A` first, so ALL working-tree changes — including modifications outside what you intended and any previously staged files — are bundled into one commit. To commit only a specific subset, pass `paths` (relative to working_dir); only those paths are staged and committed, and other pre-staged or unstaged changes are left untouched.",
     "name": "commit"
   },
@@ -19,6 +23,10 @@ expression: tool_summary
   {
     "description": "Run `git fetch` against a remote. Working tree unchanged. No write to local branches (refs/remotes/* only).",
     "name": "fetch"
+  },
+  {
+    "description": "Check whether a commit is reachable from any remote tracking ref. Returns pushed (bool) and refs (list of remote ref names containing the commit). Assumes remote refs are up-to-date (call `fetch` first if needed).",
+    "name": "is_pushed"
   },
   {
     "description": "Show git log (commit history) for a working directory. Does not require session_start.",
@@ -47,6 +55,10 @@ expression: tool_summary
   {
     "description": "Show git status (branch, changed files) for a working directory. Does not require session_start.",
     "name": "status"
+  },
+  {
+    "description": "List commits present on a local branch but not yet on its remote tracking ref. Returns commits, count, and remote_head as typed fields. Assumes remote refs are up-to-date (call `fetch` first if needed).",
+    "name": "unpushed_commits"
   },
   {
     "description": "Create a new git worktree under .worktrees/ with a new branch. Requires session_start. Registers the worktree to this session for ownership tracking.",

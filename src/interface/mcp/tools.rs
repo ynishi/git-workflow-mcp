@@ -132,6 +132,36 @@ struct SessionReleaseRequest {
     name: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct BranchStatusRequest {
+    /// Working directory path (worktree or repo root)
+    working_dir: String,
+    /// Branch to inspect (e.g. "main", "task/my-feature")
+    branch: String,
+    /// Base ref to compare against (e.g. "origin/main"). Must be resolvable in the repo.
+    base: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct UnpushedCommitsRequest {
+    /// Working directory path (worktree or repo root)
+    working_dir: String,
+    /// Local branch name (e.g. "main", "task/my-feature")
+    branch: String,
+    /// Remote name (default: "origin")
+    remote: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct IsPushedRequest {
+    /// Working directory path (worktree or repo root)
+    working_dir: String,
+    /// Commit hash (full or abbreviated)
+    commit: String,
+    /// Remote name (default: "origin")
+    remote: Option<String>,
+}
+
 // ─── Tools ───────────────────────────────────────────────
 
 #[tool_router(vis = "pub(super)")]
@@ -684,6 +714,101 @@ impl GitWorkflowServer {
         }
         Ok(CallToolResult::success(vec![rmcp::model::Content::text(
             output,
+        )]))
+    }
+
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "branch_status"),
+        err
+    )]
+    #[tool(
+        name = "branch_status",
+        description = "Compare a branch against a base (typically its upstream remote tracking branch) and return ahead/behind commit counts as discrete typed fields, never as a formatted string. Use this to decide whether push/pull is needed without parsing git output. Assumes remote refs are up-to-date (call `fetch` first if needed).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn branch_status(
+        &self,
+        Parameters(req): Parameters<BranchStatusRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let working_dir = std::path::Path::new(&req.working_dir);
+        let result =
+            git::branch_status(working_dir, &req.branch, &req.base).map_err(Self::to_mcp_error)?;
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            Self::to_mcp_error(crate::domain::error::DomainError::Git(format!(
+                "json serialize failed: {e}"
+            )))
+        })?;
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            json,
+        )]))
+    }
+
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "unpushed_commits"),
+        err
+    )]
+    #[tool(
+        name = "unpushed_commits",
+        description = "List commits present on a local branch but not yet on its remote tracking ref. Returns commits, count, and remote_head as typed fields. Assumes remote refs are up-to-date (call `fetch` first if needed).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn unpushed_commits(
+        &self,
+        Parameters(req): Parameters<UnpushedCommitsRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let working_dir = std::path::Path::new(&req.working_dir);
+        let remote = req.remote.as_deref().unwrap_or("origin");
+        let result =
+            git::unpushed_commits(working_dir, &req.branch, remote).map_err(Self::to_mcp_error)?;
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            Self::to_mcp_error(crate::domain::error::DomainError::Git(format!(
+                "json serialize failed: {e}"
+            )))
+        })?;
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            json,
+        )]))
+    }
+
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "is_pushed"),
+        err
+    )]
+    #[tool(
+        name = "is_pushed",
+        description = "Check whether a commit is reachable from any remote tracking ref. Returns pushed (bool) and refs (list of remote ref names containing the commit). Assumes remote refs are up-to-date (call `fetch` first if needed).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn is_pushed(
+        &self,
+        Parameters(req): Parameters<IsPushedRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let working_dir = std::path::Path::new(&req.working_dir);
+        let remote = req.remote.as_deref().unwrap_or("origin");
+        let result =
+            git::is_pushed(working_dir, &req.commit, remote).map_err(Self::to_mcp_error)?;
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            Self::to_mcp_error(crate::domain::error::DomainError::Git(format!(
+                "json serialize failed: {e}"
+            )))
+        })?;
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            json,
         )]))
     }
 }
