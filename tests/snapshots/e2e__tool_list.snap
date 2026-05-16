@@ -41,6 +41,10 @@ expression: tool_summary
     "name": "remote_list"
   },
   {
+    "description": "Compute the target commit hash N steps back from `from` using a strict first-parent walk (never `HEAD~N` arithmetic). Returns target_hash, target_subject, and linear (false if any merge commit was on the traversal path). Does NOT perform an actual reset; only computes the target hash. To execute the reset, use `safe_reset` with the returned hash.",
+    "name": "reset_target"
+  },
+  {
     "description": "Safely reset HEAD to a target commit. Only supports 'soft' (move HEAD, keep staged and working tree) and 'mixed' (move HEAD, unstage changes, keep working tree) modes. Hard reset is intentionally not supported. Returns the previous HEAD hash for recovery. Does not require session_start.",
     "name": "safe_reset"
   },
@@ -57,6 +61,10 @@ expression: tool_summary
     "name": "status"
   },
   {
+    "description": "Check whether a tag is pushed to a remote by directly querying the remote's tag refs (never using local tag metadata). Returns pushed (bool) and remote_refs (list of matching refs). Queries remote refs directly via `git ls-remote --tags`. Network access to remote required. Does not depend on local tag metadata or fetch state.",
+    "name": "tag_pushed"
+  },
+  {
     "description": "List commits present on a local branch but not yet on its remote tracking ref. Returns commits, count, and remote_head as typed fields. Assumes remote refs are up-to-date (call `fetch` first if needed).",
     "name": "unpushed_commits"
   },
@@ -71,5 +79,9 @@ expression: tool_summary
   {
     "description": "Remove a worktree. Only the session that created it can remove it. Requires session_start.",
     "name": "worktree_remove"
+  },
+  {
+    "description": "Return a typed snapshot of a worktree's state: clean, ahead, behind, tracking, uncommitted. Combines branch_status (ahead/behind), upstream tracking ref, and uncommitted file count in one call. Assumes remote refs are up-to-date (call `fetch` first if needed).",
+    "name": "worktree_state"
   }
 ]

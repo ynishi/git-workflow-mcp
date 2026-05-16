@@ -162,6 +162,34 @@ struct IsPushedRequest {
     remote: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct TagPushedRequest {
+    /// Working directory path (worktree or repo root)
+    working_dir: String,
+    /// Tag name without `refs/tags/` prefix (e.g. "v1.0.0")
+    tag: String,
+    /// Remote name (default: "origin")
+    remote: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ResetTargetRequest {
+    /// Working directory path (worktree or repo root)
+    working_dir: String,
+    /// Number of first-parent steps to walk back from `from`
+    steps_back: u32,
+    /// Starting ref (default: "HEAD")
+    from: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WorktreeStateRequest {
+    /// Working directory path (worktree or repo root)
+    working_dir: String,
+    /// Branch to inspect (default: current branch)
+    branch: Option<String>,
+}
+
 // ─── Tools ───────────────────────────────────────────────
 
 #[tool_router(vis = "pub(super)")]
@@ -802,6 +830,100 @@ impl GitWorkflowServer {
         let remote = req.remote.as_deref().unwrap_or("origin");
         let result =
             git::is_pushed(working_dir, &req.commit, remote).map_err(Self::to_mcp_error)?;
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            Self::to_mcp_error(crate::domain::error::DomainError::Git(format!(
+                "json serialize failed: {e}"
+            )))
+        })?;
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            json,
+        )]))
+    }
+
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "tag_pushed"),
+        err
+    )]
+    #[tool(
+        name = "tag_pushed",
+        description = "Check whether a tag is pushed to a remote by directly querying the remote's tag refs (never using local tag metadata). Returns pushed (bool) and remote_refs (list of matching refs). Queries remote refs directly via `git ls-remote --tags`. Network access to remote required. Does not depend on local tag metadata or fetch state.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn tag_pushed(
+        &self,
+        Parameters(req): Parameters<TagPushedRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let working_dir = std::path::Path::new(&req.working_dir);
+        let remote = req.remote.as_deref().unwrap_or("origin");
+        let result = git::tag_pushed(working_dir, &req.tag, remote).map_err(Self::to_mcp_error)?;
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            Self::to_mcp_error(crate::domain::error::DomainError::Git(format!(
+                "json serialize failed: {e}"
+            )))
+        })?;
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            json,
+        )]))
+    }
+
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "reset_target"),
+        err
+    )]
+    #[tool(
+        name = "reset_target",
+        description = "Compute the target commit hash N steps back from `from` using a strict first-parent walk (never `HEAD~N` arithmetic). Returns target_hash, target_subject, and linear (false if any merge commit was on the traversal path). Does NOT perform an actual reset; only computes the target hash. To execute the reset, use `safe_reset` with the returned hash.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn reset_target(
+        &self,
+        Parameters(req): Parameters<ResetTargetRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let working_dir = std::path::Path::new(&req.working_dir);
+        let from = req.from.as_deref().unwrap_or("HEAD");
+        let result =
+            git::reset_target(working_dir, req.steps_back, from).map_err(Self::to_mcp_error)?;
+        let json = serde_json::to_string_pretty(&result).map_err(|e| {
+            Self::to_mcp_error(crate::domain::error::DomainError::Git(format!(
+                "json serialize failed: {e}"
+            )))
+        })?;
+        Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+            json,
+        )]))
+    }
+
+    #[tracing::instrument(
+        skip(self, req),
+        fields(session_id = %self.session_id, tool = "worktree_state"),
+        err
+    )]
+    #[tool(
+        name = "worktree_state",
+        description = "Return a typed snapshot of a worktree's state: clean, ahead, behind, tracking, uncommitted. Combines branch_status (ahead/behind), upstream tracking ref, and uncommitted file count in one call. Assumes remote refs are up-to-date (call `fetch` first if needed).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    async fn worktree_state(
+        &self,
+        Parameters(req): Parameters<WorktreeStateRequest>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let working_dir = std::path::Path::new(&req.working_dir);
+        let result =
+            git::worktree_state(working_dir, req.branch.as_deref()).map_err(Self::to_mcp_error)?;
         let json = serde_json::to_string_pretty(&result).map_err(|e| {
             Self::to_mcp_error(crate::domain::error::DomainError::Git(format!(
                 "json serialize failed: {e}"
